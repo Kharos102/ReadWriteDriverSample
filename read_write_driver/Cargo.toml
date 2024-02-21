@@ -1,0 +1,28 @@
+[package]
+name = "read_write_driver"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+wdk = "0.2.0"
+wdk-alloc = "0.2.0"
+wdk-panic = "0.2.0"
+wdk-sys = "0.2.0"
+
+[build-dependencies]
+wdk-build = "0.2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[package.metadata.wdk]
+
+

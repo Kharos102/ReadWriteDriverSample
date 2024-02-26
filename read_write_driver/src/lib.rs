@@ -3,8 +3,13 @@
 #[cfg(not(test))]
 extern crate wdk_panic;
 
-use core::{arch::asm, ffi::c_void};
+use core::{
+    arch::asm,
+    ffi::c_void,
+    sync::atomic::{AtomicBool, AtomicUsize},
+};
 
+use alloc::vec::Vec;
 #[cfg(not(test))]
 use wdk_alloc::WDKAllocator;
 
@@ -18,11 +23,54 @@ pub(crate) mod uni;
 
 pub(crate) mod shared;
 
-use wdk_sys::{DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS, PCUNICODE_STRING};
+use wdk_sys::{
+    ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
+    PCUNICODE_STRING,
+};
 
 // Exposed device name used for user<>driver communication
 const NT_DEVICE_NAME_PATH: &str = "\\Device\\ReadWriteDevice";
 const DOS_DEVICE_NAME_PATH: &str = "\\DosDevices\\ReadWriteDevice";
+
+/// Number of logical cores (NUM_LOGICAL_CORES) on the system using OnceLock and KeQueryActiveProcessorCount
+static NUM_LOGICAL_CORES: AtomicUsize = AtomicUsize::new(0);
+
+/// Flag indicating if the cores should be released
+static RELEASE_CORES: AtomicBool = AtomicBool::new(false);
+
+/// Number of cores currently checked-in / on hold
+static CORES_CHECKED_IN: AtomicUsize = AtomicUsize::new(0);
+
+static CORE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+struct CoreLock {
+    allocated_dpcs: Vec<*mut wdk_sys::KDPC>,
+}
+
+// Impl drop for corelock that will set the release cores flag to true, wait for
+// all cores to check out, and then reset the core lock held flag.
+impl Drop for CoreLock {
+    fn drop(&mut self) {
+        // Set the release flag
+        RELEASE_CORES.store(true, core::sync::atomic::Ordering::SeqCst);
+        // Wait for all cores to check out
+        while CORES_CHECKED_IN.load(core::sync::atomic::Ordering::SeqCst) > 0 {
+            // Spin
+        }
+        // All cores have checked out, reset the release flag
+        RELEASE_CORES.store(false, core::sync::atomic::Ordering::SeqCst);
+
+        // Reset the core lock held flag
+        CORE_LOCK_HELD.store(false, core::sync::atomic::Ordering::SeqCst);
+
+        // Free the allocated DPCs
+        for dpc in self.allocated_dpcs.iter() {
+            unsafe {
+                wdk_sys::ntddk::ExFreePool(*dpc as *mut c_void);
+            }
+        }
+    }
+}
 
 #[export_name = "DriverEntry"] // WDF expects a symbol with the name DriverEntry
 pub unsafe extern "system" fn driver_entry(
@@ -69,6 +117,13 @@ pub unsafe extern "system" fn driver_entry(
         wdk_sys::ntddk::IoDeleteDevice(device_obj);
         return status;
     }
+
+    // Initialize the number of logical cores
+    {
+        let core_count = unsafe { KeQueryActiveProcessorCount(core::ptr::null_mut()) as usize };
+        NUM_LOGICAL_CORES.store(core_count, core::sync::atomic::Ordering::SeqCst);
+    }
+
     // At this point we have a device and a symbolic link, return success
     wdk_sys::STATUS_SUCCESS
 }
@@ -167,32 +222,121 @@ fn handle_ioctl_request(
         *cr3_ptr
     };
 
-    // Raise IRQL to DISPATCH_LEVEL using KfRaiseIrql to prevent context switches while using the target's cr3
-    let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
-    // Modify our CR3 to the targets, backing up our original cr3
-    let old_cr3: usize;
-    unsafe {
-        asm!("mov {}, cr3", out(reg) old_cr3);
-        asm!("mov cr3, {}", in(reg) cr3);
-    }
-    // Copy buffer to address as requested by user.
-    // SAFETY: We don't verify the provided address is valid, accessible / paged-in or writable at all. This can result in
-    // exceptions or faults. That combined with being in DISPATCH_LEVEL makes this a dangerous operation.
-    // We should be probing and locking pages for safety.
-    unsafe {
-        core::ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, buffer_len);
-    }
+    {
+        let _lock = freeze_all_cores();
 
-    // Restore our previous cr3
-    unsafe {
-        asm!("mov cr3, {}", in(reg) old_cr3);
-    }
+        // Raise IRQL to DISPATCH_LEVEL using KfRaiseIrql to prevent context switches while using the target's cr3
+        let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
+        // Modify our CR3 to the targets, backing up our original cr3
+        let old_cr3: usize;
+        unsafe {
+            asm!("mov {}, cr3", out(reg) old_cr3);
+            asm!("mov cr3, {}", in(reg) cr3);
+        }
+        // Copy buffer to address as requested by user.
+        // SAFETY: We don't verify the provided address is valid, accessible / paged-in or writable at all. This can result in
+        // exceptions or faults. That combined with being in DISPATCH_LEVEL makes this a dangerous operation.
+        // We should be probing and locking pages for safety.
+        unsafe {
+            core::ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, buffer_len);
+        }
 
-    // Lower IRQL to our previous level
-    unsafe { wdk_sys::ntddk::KeLowerIrql(old_irql) };
+        // Restore our previous cr3
+        unsafe {
+            asm!("mov cr3, {}", in(reg) old_cr3);
+        }
+
+        // Lower IRQL to our previous level
+        unsafe { wdk_sys::ntddk::KeLowerIrql(old_irql) };
+
+        // _lock will be dropped, auto releasing the cores
+    }
 
     // Success
     Ok(())
+}
+
+/// Freeze all cores on the system. Returns a `CoreLock` which will release the cores when dropped.
+fn freeze_all_cores() -> CoreLock {
+    // Ensure the cores are not already locked, if not swap the lock to true
+    if CORE_LOCK_HELD.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        panic!("Cores are already locked");
+    }
+
+    let mut allocated_dpcs =
+        Vec::with_capacity(NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst));
+
+    // For all cores (except the current core), Create a DPC with KeInitializeDpc and KeSetTargetProcessorDpc
+    // to freeze the core. Then, wait for all cores to check in and return the CoreLock.
+    let current_core =
+        unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) } as usize;
+    for core in 0..NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst) {
+        if core != current_core {
+            let tag = 0x647772;
+            // Create a DPC for the core
+            // The DPC should be allocated from NonPagedPool, allocate it using ExAllocatePool2
+            let dpc = unsafe {
+                let buffer = wdk_sys::ntddk::ExAllocatePool2(
+                    wdk_sys::POOL_FLAG_NON_PAGED,
+                    core::mem::size_of::<wdk_sys::KDPC>() as u64,
+                    tag,
+                ) as *mut wdk_sys::KDPC;
+
+                // Assert the buffer is non-null
+                assert_ne!(buffer, core::ptr::null_mut());
+                // Write a default KDPC to the buffer
+                core::ptr::write(buffer, wdk_sys::KDPC::default());
+
+                // Store the allocated DPC for cleanup
+                allocated_dpcs.push(buffer);
+
+                // Send up the default non-paged initialized KDPC
+                buffer
+            };
+
+            // Initialize the DPC
+            unsafe {
+                wdk_sys::ntddk::KeInitializeDpc(dpc, Some(freeze_core), core::ptr::null_mut());
+            }
+            // Set the target processor for the DPC
+            unsafe {
+                wdk_sys::ntddk::KeSetTargetProcessorDpc(dpc, core as i8);
+                // Queue the DPC
+                wdk_sys::ntddk::KeInsertQueueDpc(dpc, core::ptr::null_mut(), core::ptr::null_mut());
+            }
+        }
+    }
+    // Wait for all cores to check in
+    while CORES_CHECKED_IN.load(core::sync::atomic::Ordering::SeqCst)
+        < NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst) - 1
+    {
+        // Spin
+    }
+    // All cores have checked in, return the CoreLock
+    CoreLock { allocated_dpcs }
+}
+
+/// Freezes a core by raising the IRQL to DISPATCH_LEVEL, checking in the core and waiting for the release signal.
+#[inline(never)]
+unsafe extern "C" fn freeze_core(
+    _kdpc: *mut wdk_sys::KDPC,
+    _deferred_context: *mut c_void,
+    _system_argument1: *mut c_void,
+    _system_argument2: *mut c_void,
+) {
+    // Raise IRQL to DISPATCH_LEVEL
+    let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
+    // Check in the core
+    CORES_CHECKED_IN.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    // Wait for the release signal
+    while !RELEASE_CORES.load(core::sync::atomic::Ordering::SeqCst) {
+        // Spin
+    }
+    // Release signal received, check-out the core
+    CORES_CHECKED_IN.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+
+    // Lower IRQL to our previous level
+    unsafe { wdk_sys::ntddk::KeLowerIrql(old_irql) };
 }
 
 /// Attempt to locate the process by PID. If found, return the PEPROCESS pointer, otherwise return None.

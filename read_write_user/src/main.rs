@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
 use clap::Parser;
+use clap_num::maybe_hex;
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE},
@@ -20,7 +21,7 @@ struct Args {
     pid: u32,
 
     // Address to write into
-    #[arg(short, long)]
+    #[arg(short, long, value_parser=maybe_hex::<usize>)]
     address: usize,
 }
 

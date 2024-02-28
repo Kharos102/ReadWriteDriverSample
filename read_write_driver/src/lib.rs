@@ -71,6 +71,24 @@ impl Drop for IrqlGuard {
     }
 }
 
+enum IoctlError {
+    InvalidBufferSize,
+    InvalidPid,
+    InvalidCr3,
+    InvalidAddress,
+}
+
+impl IoctlError {
+    fn status(&self) -> NTSTATUS {
+        match self {
+            IoctlError::InvalidBufferSize => wdk_sys::STATUS_INVALID_BUFFER_SIZE,
+            IoctlError::InvalidPid => wdk_sys::STATUS_INVALID_PARAMETER,
+            IoctlError::InvalidCr3 => wdk_sys::STATUS_INVALID_PARAMETER,
+            IoctlError::InvalidAddress => wdk_sys::STATUS_ACCESS_VIOLATION,
+        }
+    }
+}
+
 fn raise_irql_to_dispatch() -> IrqlGuard {
     let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
     IrqlGuard { old_irql }
@@ -199,9 +217,9 @@ pub unsafe extern "C" fn device_ioctl_handler(
                         wdk_sys::ntddk::IofCompleteRequest(irp, 0);
                         return wdk_sys::STATUS_SUCCESS;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Failed to handle the request, return invalid parameter
-                        irp.IoStatus.__bindgen_anon_1.Status = wdk_sys::STATUS_INVALID_PARAMETER;
+                        irp.IoStatus.__bindgen_anon_1.Status = e.status();
                         irp.IoStatus.Information = 0;
                         wdk_sys::ntddk::IofCompleteRequest(irp, 0);
                         return wdk_sys::STATUS_INVALID_PARAMETER;
@@ -224,7 +242,7 @@ pub unsafe extern "C" fn device_ioctl_handler(
 fn handle_ioctl_request(
     ioctl_request: &shared::ReadWriteIoctl,
     buffer_len_max: usize,
-) -> Result<(), ()> {
+) -> Result<(), IoctlError> {
     let header = &ioctl_request.header;
     let address = header.address;
     let buffer_len = header.buffer_len;
@@ -237,7 +255,7 @@ fn handle_ioctl_request(
     if core::mem::size_of::<shared::ReadWriteIoctl>() + buffer_len > buffer_len_max {
         // The size of the provided ioctl_request (including the dynamic buffer portion) exceeds the bounds of the provided input buffer,
         // if we continued to parse the request we'd be reading out of bounds. Return an error.
-        return Err(());
+        return Err(IoctlError::InvalidBufferSize);
     }
     // The dynamic buffer portion is of a dynamic length, so we need to convert it to a slice
     // using the provided buffer_len.
@@ -246,7 +264,7 @@ fn handle_ioctl_request(
     // Get the KPROCESS from the target_pid if it exists, or return an error
     let process = match process_from_pid(header.target_pid) {
         Some(process) => process,
-        None => return Err(()),
+        None => return Err(IoctlError::InvalidPid),
     };
 
     // Get offset 0x28 from the KPROCESS which is the DirectoryTableBase / cr3
@@ -255,6 +273,10 @@ fn handle_ioctl_request(
         let cr3_ptr = (process.handle as *const u8).add(cr3_offset) as *const usize;
         *cr3_ptr
     };
+
+    if !is_likely_cr3(cr3) {
+        return Err(IoctlError::InvalidCr3);
+    }
 
     {
         let _lock = freeze_all_cores();
@@ -276,7 +298,7 @@ fn handle_ioctl_request(
             for i in 0..buffer_len {
                 let address = address + i;
                 if unsafe { wdk_sys::ntddk::MmIsAddressValid(address as *mut c_void) } != 1 {
-                    return Err(());
+                    return Err(IoctlError::InvalidAddress);
                 }
             }
 
@@ -405,6 +427,20 @@ pub unsafe extern "C" fn device_unload(driver_obj: *mut DRIVER_OBJECT) {
     if !(*driver_obj).DeviceObject.is_null() {
         wdk_sys::ntddk::IoDeleteDevice((*driver_obj).DeviceObject);
     }
+}
+
+/// Return whether the provided address/usize appears to be on a page boundary
+fn is_page_aligned(address: usize) -> bool {
+    address & 0xFFF == 0
+}
+
+/// Checks whether the provided value appears to be a valid CR3.
+/// This only guesses by performing a few checks that apply to how CR3 values are
+/// used on Windows, but are not strictly guaranteed to be true.
+fn is_likely_cr3(cr3: usize) -> bool {
+    // Check if the value is page aligned, less than 0x0000_FFFF_FFFF_FFFF, and non-zero
+    const CR3_EXPECTED_MAX: usize = 0x0000_FFFF_FFFF_FFFF;
+    is_page_aligned(cr3) && cr3 < CR3_EXPECTED_MAX && cr3 != 0
 }
 
 /// Create and close handlers for the device object. These are required to permit DeviceIoControl calls from user.

@@ -38,15 +38,20 @@ static NUM_LOGICAL_CORES: AtomicUsize = AtomicUsize::new(0);
 /// Flag indicating if the cores should be released
 static RELEASE_CORES: AtomicBool = AtomicBool::new(false);
 
-/// Number of cores currently checked-in / on hold
+/// Number of cores currently checked-in / on hold when freezing cores
 static CORES_CHECKED_IN: AtomicUsize = AtomicUsize::new(0);
 
+/// Flag indicating if the global core lock is held, used when freezing cores
 static CORE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
 
+/// CoreLock is a struct that is held when the cores are frozen, and released when the cores are unfrozen.
+/// Cores are frozen by scheduling a DPC on each core to raise the IRQL to DISPATCH_LEVEL, and then checked in.
+/// We track all allocated DPCs so that we can free them when the CoreLock is dropped.
 struct CoreLock {
     allocated_dpcs: Vec<*mut wdk_sys::KDPC>,
 }
 
+/// Wrapper around the PEPROCESS handle to ensure it is dereferenced when dropped
 struct PeProcessHandle {
     handle: wdk_sys::PEPROCESS,
 }
@@ -59,6 +64,8 @@ impl Drop for PeProcessHandle {
     }
 }
 
+/// Wrapper around an old IRQL value (after a call to raise IRQL) that will lower the IRQL
+/// to its original value when dropped.
 struct IrqlGuard {
     old_irql: u8,
 }
@@ -71,6 +78,7 @@ impl Drop for IrqlGuard {
     }
 }
 
+/// Errors that can occur when handling IOCTL requests, can be converted to NTSTATUS
 enum IoctlError {
     InvalidBufferSize,
     InvalidPid,
@@ -89,6 +97,7 @@ impl IoctlError {
     }
 }
 
+/// Raise the IRQL to DISPATCH_LEVEL and return an IrqlGuard that will lower the IRQL when dropped.
 fn raise_irql_to_dispatch() -> IrqlGuard {
     let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
     IrqlGuard { old_irql }
@@ -274,14 +283,16 @@ fn handle_ioctl_request(
         *cr3_ptr
     };
 
+    // Check if our obtained cr3 is likely to be a valid cr3
     if !is_likely_cr3(cr3) {
         return Err(IoctlError::InvalidCr3);
     }
 
     {
+        // Freeze all other cores on the system to prevent any other threads from modifying the target process
         let _lock = freeze_all_cores();
         {
-            // Raise IRQL to DISPATCH_LEVEL
+            // Raise our IRQL to prevent task-switching
             let _irql_guard = raise_irql_to_dispatch();
             // Modify our CR3 to the targets, backing up our original cr3
             let old_cr3: usize;
@@ -328,7 +339,7 @@ fn freeze_all_cores() -> CoreLock {
     if CORE_LOCK_HELD.swap(true, core::sync::atomic::Ordering::SeqCst) {
         panic!("Cores are already locked");
     }
-
+    // Create a vector to store the allocated DPCs for cleanup
     let mut allocated_dpcs =
         Vec::with_capacity(NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst));
 
@@ -372,11 +383,11 @@ fn freeze_all_cores() -> CoreLock {
             }
         }
     }
-    // Wait for all cores to check in
+    // Wait for all other cores to check in to ensure they are frozen before we proceed further
     while CORES_CHECKED_IN.load(core::sync::atomic::Ordering::SeqCst)
         < NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst) - 1
     {
-        // Spin
+        // Spin/wait
     }
     // All cores have checked in, return the CoreLock
     CoreLock { allocated_dpcs }
@@ -390,21 +401,21 @@ unsafe extern "C" fn freeze_core(
     _system_argument1: *mut c_void,
     _system_argument2: *mut c_void,
 ) {
-    // Raise IRQL to DISPATCH_LEVEL
+    // Raise IRQL to DISPATCH_LEVEL to prevent task-switching, ensuring our thread is the only one running on the core
     let _irql_guard = raise_irql_to_dispatch();
-    // Check in the core
+    // Check in the core to indicate it is frozen
     CORES_CHECKED_IN.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     // Wait for the release signal
     while !RELEASE_CORES.load(core::sync::atomic::Ordering::SeqCst) {
-        // Spin
+        // Spin/wait
     }
-    // Release signal received, check-out the core
+    // Release signal received, check-out the core as we will no longer freeze this core
     CORES_CHECKED_IN.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
 
     // irql_guard will be dropped, auto lowering the irql
 }
 
-/// Attempt to locate the process by PID. If found, return the PEPROCESS pointer, otherwise return None.
+/// Attempt to locate the process by PID. If found, return the a wrapper to it, otherwise return None.
 fn process_from_pid(pid: u32) -> Option<PeProcessHandle> {
     let mut handle: wdk_sys::PEPROCESS = core::ptr::null_mut();
     let status =
@@ -418,6 +429,15 @@ fn process_from_pid(pid: u32) -> Option<PeProcessHandle> {
 
 /// Unload the driver. This function will delete the symbolic link and the device object if it exists.
 pub unsafe extern "C" fn device_unload(driver_obj: *mut DRIVER_OBJECT) {
+    // Check if any cores are currently frozen, this should never happen.
+    // If they are frozen, wait a little to see if they unfreeze and if not, panic.
+    if CORES_CHECKED_IN.load(core::sync::atomic::Ordering::SeqCst) > 0 {
+        for _ in 0..1000 {
+            // Spin
+        }
+        panic!("Cores are still frozen while attempting to unload the driver");
+    }
+
     // Delete symbolic link
     let dos_device_name = uni::str_to_unicode(DOS_DEVICE_NAME_PATH);
     let mut dos_device_name_uni = dos_device_name.to_unicode();

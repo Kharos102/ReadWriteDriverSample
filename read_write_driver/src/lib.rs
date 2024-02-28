@@ -47,6 +47,18 @@ struct CoreLock {
     allocated_dpcs: Vec<*mut wdk_sys::KDPC>,
 }
 
+struct PeProcessHandle {
+    handle: wdk_sys::PEPROCESS,
+}
+
+impl Drop for PeProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            wdk_sys::ntddk::ObfDereferenceObject(self.handle as *mut c_void);
+        }
+    }
+}
+
 // Impl drop for corelock that will set the release cores flag to true, wait for
 // all cores to check out, and then reset the core lock held flag.
 impl Drop for CoreLock {
@@ -218,7 +230,7 @@ fn handle_ioctl_request(
     // Get offset 0x28 from the KPROCESS which is the DirectoryTableBase / cr3
     let cr3 = unsafe {
         let cr3_offset = 0x28;
-        let cr3_ptr = (process as *const u8).add(cr3_offset) as *const usize;
+        let cr3_ptr = (process.handle as *const u8).add(cr3_offset) as *const usize;
         *cr3_ptr
     };
 
@@ -340,12 +352,12 @@ unsafe extern "C" fn freeze_core(
 }
 
 /// Attempt to locate the process by PID. If found, return the PEPROCESS pointer, otherwise return None.
-fn process_from_pid(pid: u32) -> Option<wdk_sys::PEPROCESS> {
-    let mut process: wdk_sys::PEPROCESS = core::ptr::null_mut();
+fn process_from_pid(pid: u32) -> Option<PeProcessHandle> {
+    let mut handle: wdk_sys::PEPROCESS = core::ptr::null_mut();
     let status =
-        unsafe { wdk_sys::ntddk::PsLookupProcessByProcessId(pid as *mut c_void, &mut process) };
+        unsafe { wdk_sys::ntddk::PsLookupProcessByProcessId(pid as *mut c_void, &mut handle) };
     if NT_SUCCESS(status) {
-        Some(process)
+        Some(PeProcessHandle { handle })
     } else {
         None
     }

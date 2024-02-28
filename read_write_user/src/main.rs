@@ -10,6 +10,7 @@ use windows::Win32::{
 
 pub mod uni;
 
+// Shared types and constants between the kernel driver and user-mode application
 #[path = "..\\..\\read_write_driver\\src\\shared.rs"]
 pub mod shared;
 
@@ -20,7 +21,7 @@ struct Args {
     #[arg(short, long)]
     pid: u32,
 
-    // Address to write into
+    // Address to write into, may be in decimal or hex (when prefixed with 0x)
     #[arg(short, long, value_parser=maybe_hex::<usize>)]
     address: usize,
 }
@@ -30,8 +31,9 @@ const DEVICE_PATH: &str = "\\\\.\\ReadWriteDevice";
 
 fn main() {
     let args = Args::parse();
-    // Hardcoded bytes we'll write into the target process
+    // Hardcoded bytes we'll write into the target process as a test. This may be replaced with a dynamic buffer.
     let buffer = [0x01, 0x03, 0x03, 0x07];
+    // Send the IOCTL request to the kernel device to write the buffer into the target process at the specified address
     write_ioctl_buffer(args.pid, args.address, &buffer);
 }
 
@@ -54,9 +56,10 @@ fn write_ioctl_buffer(pid: u32, address: usize, buffer: &[u8]) {
     // Create the IOCTL request
     // Determine size of the entire request, which is the size of the header plus the size of the dynamic buffer
     let req_size = core::mem::size_of::<shared::ReadWriteIoctl>() + buffer.len();
-    // Create a new buffer to hold the request
+    // Create a new dynamic-sized buffer to hold the request
     let mut req_buffer: VLS<shared::ReadWriteIoctl> = VLS::new(req_size);
     unsafe {
+        // Get a mutable reference to the request buffer for initialization
         let req = req_buffer.as_mut();
         // Write the header of the request
         *req = shared::ReadWriteIoctl {
@@ -67,10 +70,10 @@ fn write_ioctl_buffer(pid: u32, address: usize, buffer: &[u8]) {
             },
             buffer: [0; 0],
         };
-        // Copy buffer into the request from the location of the `buffer` field
+        // Copy our dynamic buffer into the request from the location of the `buffer` field, this initializes the buffer in our ReadWriteIoctl struct
         std::ptr::copy_nonoverlapping(buffer.as_ptr(), (*req).buffer.as_mut_ptr(), buffer.len());
     }
-    // Send the ioctl request
+    // Send the ioctl request and ensure it was successful (or panic if it wasn't)
     let mut bytes_written = 0;
     unsafe {
         DeviceIoControl(
@@ -87,13 +90,14 @@ fn write_ioctl_buffer(pid: u32, address: usize, buffer: &[u8]) {
     }
 }
 
-/// Variable-length buffer of type T, allows allocating a dynamic-sized buffer and treating it as a type T
+/// Variable-length buffer of dynamic type T, allows allocating a dynamic-sized buffer and treating it as a type T
 #[derive(Default)]
 pub struct VLS<T> {
     v: Vec<u8>,
     _phantom: PhantomData<T>,
 }
 
+// Implement deref and deref_mut to allow treating the VLS as a type T
 impl<T> core::ops::Deref for VLS<T> {
     type Target = T;
 
@@ -108,6 +112,7 @@ impl<T> core::ops::DerefMut for VLS<T> {
     }
 }
 
+// If T is Copy, we can implement From<T> for VLS<T> to allow creating a VLS from a value of type T
 impl<T: Copy> From<T> for VLS<T> {
     fn from(val: T) -> Self {
         let mut ret = Self::new(core::mem::size_of_val(&val));
@@ -148,8 +153,7 @@ impl<T> VLS<T> {
         }
     }
 
-    /// Returns a raw mut pointer to the data in question, used to do low level
-    /// data operations.
+    /// Returns a raw mut pointer to T
     pub fn as_mut(&mut self) -> *mut T {
         self.v.as_mut_ptr() as *mut T
     }

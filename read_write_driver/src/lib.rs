@@ -59,6 +59,23 @@ impl Drop for PeProcessHandle {
     }
 }
 
+struct IrqlGuard {
+    old_irql: u8,
+}
+
+impl Drop for IrqlGuard {
+    fn drop(&mut self) {
+        unsafe {
+            wdk_sys::ntddk::KeLowerIrql(self.old_irql);
+        }
+    }
+}
+
+fn raise_irql_to_dispatch() -> IrqlGuard {
+    let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
+    IrqlGuard { old_irql }
+}
+
 // Impl drop for corelock that will set the release cores flag to true, wait for
 // all cores to check out, and then reset the core lock held flag.
 impl Drop for CoreLock {
@@ -211,6 +228,11 @@ fn handle_ioctl_request(
     let header = &ioctl_request.header;
     let address = header.address;
     let buffer_len = header.buffer_len;
+
+    // If we're attempting to write 0 bytes, we can just return success now
+    if buffer_len == 0 {
+        return Ok(());
+    }
     // Validate that the entire ReadWriteIoctl request (incl. dynamic buffer) is within the input buffer max bounds
     if core::mem::size_of::<shared::ReadWriteIoctl>() + buffer_len > buffer_len_max {
         // The size of the provided ioctl_request (including the dynamic buffer portion) exceeds the bounds of the provided input buffer,
@@ -236,30 +258,40 @@ fn handle_ioctl_request(
 
     {
         let _lock = freeze_all_cores();
+        {
+            // Raise IRQL to DISPATCH_LEVEL
+            let _irql_guard = raise_irql_to_dispatch();
+            // Modify our CR3 to the targets, backing up our original cr3
+            let old_cr3: usize;
+            unsafe {
+                asm!("mov {}, cr3", out(reg) old_cr3);
+                asm!("mov cr3, {}", in(reg) cr3);
+            }
 
-        // Raise IRQL to DISPATCH_LEVEL using KfRaiseIrql to prevent context switches while using the target's cr3
-        let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
-        // Modify our CR3 to the targets, backing up our original cr3
-        let old_cr3: usize;
-        unsafe {
-            asm!("mov {}, cr3", out(reg) old_cr3);
-            asm!("mov cr3, {}", in(reg) cr3);
-        }
-        // Copy buffer to address as requested by user.
-        // SAFETY: We don't verify the provided address is valid, accessible / paged-in or writable at all. This can result in
-        // exceptions or faults. That combined with being in DISPATCH_LEVEL makes this a dangerous operation.
-        // We should be probing and locking pages for safety.
-        unsafe {
-            core::ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, buffer_len);
-        }
+            // For every byte we wish to access, we need to ensure the address is accessible. As we've guaranteed all other cores are frozen and
+            // our thread cannot be task-switched, we can trust the result of the following checks as there is no opportunity for another thread
+            // to modify the state of the target process.
+            // Loop through each address we intend to touch (starting at the provided address, and ending at the provided address + buffer_len) and ensure the
+            // result of a call to MmIsAddressValid is true. If it is not, return an error.
+            for i in 0..buffer_len {
+                let address = address + i;
+                if unsafe { wdk_sys::ntddk::MmIsAddressValid(address as *mut c_void) } != 1 {
+                    return Err(());
+                }
+            }
 
-        // Restore our previous cr3
-        unsafe {
-            asm!("mov cr3, {}", in(reg) old_cr3);
-        }
+            // Copy buffer to address as requested by user.
+            unsafe {
+                core::ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, buffer_len);
+            }
 
-        // Lower IRQL to our previous level
-        unsafe { wdk_sys::ntddk::KeLowerIrql(old_irql) };
+            // Restore our previous cr3
+            unsafe {
+                asm!("mov cr3, {}", in(reg) old_cr3);
+            }
+
+            // irql_guard will be dropped, auto lowering the irql
+        }
 
         // _lock will be dropped, auto releasing the cores
     }
@@ -337,7 +369,7 @@ unsafe extern "C" fn freeze_core(
     _system_argument2: *mut c_void,
 ) {
     // Raise IRQL to DISPATCH_LEVEL
-    let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
+    let _irql_guard = raise_irql_to_dispatch();
     // Check in the core
     CORES_CHECKED_IN.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     // Wait for the release signal
@@ -347,8 +379,7 @@ unsafe extern "C" fn freeze_core(
     // Release signal received, check-out the core
     CORES_CHECKED_IN.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
 
-    // Lower IRQL to our previous level
-    unsafe { wdk_sys::ntddk::KeLowerIrql(old_irql) };
+    // irql_guard will be dropped, auto lowering the irql
 }
 
 /// Attempt to locate the process by PID. If found, return the PEPROCESS pointer, otherwise return None.

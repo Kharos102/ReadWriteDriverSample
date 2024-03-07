@@ -64,16 +64,27 @@ impl Drop for PeProcessHandle {
     }
 }
 
+enum IrqlGuardMethod {
+    RaiseIrql,
+    RaiseIrqlDirect,
+}
+
 /// Wrapper around an old IRQL value (after a call to raise IRQL) that will lower the IRQL
 /// to its original value when dropped.
 struct IrqlGuard {
     old_irql: u8,
+    method: IrqlGuardMethod,
 }
 
 impl Drop for IrqlGuard {
     fn drop(&mut self) {
         unsafe {
-            wdk_sys::ntddk::KeLowerIrql(self.old_irql);
+            match self.method {
+                IrqlGuardMethod::RaiseIrql => wdk_sys::ntddk::KeLowerIrql(self.old_irql),
+                IrqlGuardMethod::RaiseIrqlDirect => {
+                    asm!("mov cr8, {}", in(reg) self.old_irql as u64)
+                }
+            }
         }
     }
 }
@@ -100,7 +111,25 @@ impl IoctlError {
 /// Raise the IRQL to DISPATCH_LEVEL and return an IrqlGuard that will lower the IRQL when dropped.
 fn raise_irql_to_dispatch() -> IrqlGuard {
     let old_irql = unsafe { wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8) };
-    IrqlGuard { old_irql }
+    IrqlGuard {
+        old_irql,
+        method: IrqlGuardMethod::RaiseIrql,
+    }
+}
+
+/// Raise the IRQL to DISPATCH_LEVEL and return an IrqlGuard that will lower the IRQL when dropped.
+/// This method directly modifies cr8 as opposed to using KfRaiseIrql.
+fn raise_irql_to_dispatch_direct() -> IrqlGuard {
+    let old_irql = unsafe {
+        let old_irql: u64;
+        asm!("mov {}, cr8", out(reg) old_irql);
+        asm!("mov cr8, {}", in(reg) wdk_sys::DISPATCH_LEVEL as u64);
+        old_irql
+    };
+    IrqlGuard {
+        old_irql: old_irql as u8,
+        method: IrqlGuardMethod::RaiseIrqlDirect,
+    }
 }
 
 // Impl drop for corelock that will set the release cores flag to true, wait for

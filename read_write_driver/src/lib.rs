@@ -322,7 +322,7 @@ fn handle_ioctl_request(
         let _lock = freeze_all_cores();
         {
             // Raise our IRQL to prevent task-switching
-            let _irql_guard = raise_irql_to_dispatch();
+            let _irql_guard = raise_irql_to_dispatch_direct();
             // Modify our CR3 to the targets, backing up our original cr3
             let old_cr3: usize;
             unsafe {
@@ -431,7 +431,7 @@ unsafe extern "C" fn freeze_core(
     _system_argument2: *mut c_void,
 ) {
     // Raise IRQL to DISPATCH_LEVEL to prevent task-switching, ensuring our thread is the only one running on the core
-    let _irql_guard = raise_irql_to_dispatch();
+    let _irql_guard = raise_irql_to_dispatch_direct();
     // Check in the core to indicate it is frozen
     CORES_CHECKED_IN.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     // Wait for the release signal

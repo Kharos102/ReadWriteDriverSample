@@ -11,6 +11,11 @@ wdk-alloc = "0.2.0"
 wdk-panic = "0.2.0"
 wdk-sys = "0.2.0"
 
+[dependencies.iced-x86]
+version = "1.21.0"
+default-features = false
+features = ["decoder", "no_std"]
+
 [build-dependencies]
 wdk-build = "0.2.0"
 

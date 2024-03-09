@@ -1,3 +1,4 @@
+#![feature(abi_x86_interrupt)]
 #![no_std]
 
 #[cfg(not(test))]
@@ -10,6 +11,7 @@ use core::{
 };
 
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering::SeqCst;
 #[cfg(not(test))]
 use wdk_alloc::WDKAllocator;
 
@@ -21,12 +23,16 @@ extern crate alloc;
 
 pub(crate) mod uni;
 
+mod interrupts;
 pub(crate) mod shared;
+mod mdl;
 
 use wdk_sys::{
     ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
     PCUNICODE_STRING,
 };
+use crate::interrupts::{PAGE_FAULT_HIT, PageFaultInterruptHandlerManager};
+use crate::mdl::MyMDL;
 
 // Exposed device name used for user<>driver communication
 const NT_DEVICE_NAME_PATH: &str = "\\Device\\ReadWriteDevice";
@@ -269,6 +275,73 @@ pub unsafe extern "C" fn device_ioctl_handler(
     }
 }
 
+enum CheckWriteMethod {
+    WindowsApi,
+    CustomPageFaultHandler
+}
+
+fn check_and_write(write_request: WriteRequest, method: CheckWriteMethod, mdl: Option<MyMDL>) -> Result<(), IoctlError> {
+    match method {
+        CheckWriteMethod::WindowsApi => check_and_write_windows(write_request),
+        CheckWriteMethod::CustomPageFaultHandler => check_and_write_page_fault(write_request, mdl.unwrap()),
+    }
+}
+
+fn check_and_write_page_fault(write_request: WriteRequest, mdl: MyMDL) -> Result<(), IoctlError> {
+    // Install our custom page fault handler
+    let mut handler_manager = PageFaultInterruptHandlerManager::new(mdl);
+    handler_manager.install_interrupt_handler();
+
+    let mut return_value = Ok(());
+    // Attempt to write the buffer to the target process
+    // For each byte we write, check the global PAGE_FAULT_HIT flag to see if a page fault occurred
+    // If a page fault occurred, return an error
+    for i in 0..write_request.buffer.len() {
+        let address = write_request.untrusted_address + i;
+
+        unsafe {
+            core::ptr::write_volatile(address as *mut u8, write_request.buffer[i]);
+        }
+        if PAGE_FAULT_HIT.load(SeqCst) {
+            return_value = Err(IoctlError::InvalidAddress);
+            break;
+        }
+    }
+
+    // Restore the original page fault handler
+    handler_manager.restore_interrupt_handler();
+    
+    Ok(())
+}
+fn check_and_write_windows(write_request: WriteRequest) -> Result<(), IoctlError> {
+    let buffer_len = write_request.buffer.len();
+    let address = write_request.untrusted_address;
+    // For every byte we wish to access, we need to ensure the address is accessible. As we've guaranteed all other cores are frozen and
+    // our thread cannot be task-switched, we can trust the result of the following checks as there is no opportunity for another thread
+    // to modify the state of the target process.
+    // Loop through each address we intend to touch (starting at the provided address, and ending at the provided address + buffer_len) and ensure the
+    // result of a call to MmIsAddressValid is true. If it is not, return an error.
+    for i in 0..buffer_len {
+        let address = address + i;
+        if unsafe { wdk_sys::ntddk::MmIsAddressValid(address as *mut c_void) } != 1 {
+            return Err(IoctlError::InvalidAddress);
+        }
+    }
+
+    // Copy buffer to address as requested by user.
+    unsafe {
+        core::ptr::copy_nonoverlapping(write_request.buffer.as_ptr(), address as *mut u8, buffer_len);
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct WriteRequest<'a> {
+    untrusted_address: usize,
+    buffer: &'a [u8],
+}
+
 /// Attempt to handle the ReadWriteIoctl request. This function will attempt to locate the target process
 /// by PID, and then copy the provided buffer to the target process's memory.
 fn handle_ioctl_request(
@@ -315,6 +388,8 @@ fn handle_ioctl_request(
         // Freeze all other cores on the system to prevent any other threads from modifying the target process
         let _lock = freeze_all_cores();
         {
+            // Pagein IDT
+            let mdl = interrupts::pagein_unprotect_idt();
             // Raise our IRQL to prevent task-switching
             let _irql_guard = raise_irql_to_dispatch(IrqlRaiseMethod::RaiseIrqlDirect);
             // Modify our CR3 to the targets, backing up our original cr3
@@ -323,23 +398,12 @@ fn handle_ioctl_request(
                 asm!("mov {}, cr3", out(reg) old_cr3);
                 asm!("mov cr3, {}", in(reg) cr3);
             }
+            let write_request = WriteRequest {
+                untrusted_address: address,
+                buffer,
+            };
 
-            // For every byte we wish to access, we need to ensure the address is accessible. As we've guaranteed all other cores are frozen and
-            // our thread cannot be task-switched, we can trust the result of the following checks as there is no opportunity for another thread
-            // to modify the state of the target process.
-            // Loop through each address we intend to touch (starting at the provided address, and ending at the provided address + buffer_len) and ensure the
-            // result of a call to MmIsAddressValid is true. If it is not, return an error.
-            for i in 0..buffer_len {
-                let address = address + i;
-                if unsafe { wdk_sys::ntddk::MmIsAddressValid(address as *mut c_void) } != 1 {
-                    return Err(IoctlError::InvalidAddress);
-                }
-            }
-
-            // Copy buffer to address as requested by user.
-            unsafe {
-                core::ptr::copy_nonoverlapping(buffer.as_ptr(), address as *mut u8, buffer_len);
-            }
+            check_and_write(write_request, CheckWriteMethod::CustomPageFaultHandler, Some(mdl))?;
 
             // Restore our previous cr3
             unsafe {

@@ -1,4 +1,5 @@
 #![feature(abi_x86_interrupt)]
+#![feature(new_uninit)]
 #![no_std]
 
 #[cfg(not(test))]
@@ -24,15 +25,15 @@ extern crate alloc;
 pub(crate) mod uni;
 
 mod interrupts;
-pub(crate) mod shared;
 mod mdl;
+pub(crate) mod shared;
 
+use crate::interrupts::{PageFaultInterruptHandlerManager, PAGE_FAULT_HIT, PROBING_ADDRESS};
+use crate::mdl::MyMDL;
 use wdk_sys::{
     ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
     PCUNICODE_STRING,
 };
-use crate::interrupts::{PAGE_FAULT_HIT, PageFaultInterruptHandlerManager};
-use crate::mdl::MyMDL;
 
 // Exposed device name used for user<>driver communication
 const NT_DEVICE_NAME_PATH: &str = "\\Device\\ReadWriteDevice";
@@ -49,6 +50,8 @@ static CORES_CHECKED_IN: AtomicUsize = AtomicUsize::new(0);
 
 /// Flag indicating if the global core lock is held, used when freezing cores
 static CORE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+static mut PAGE_FAULT_MANAGER: Option<PageFaultInterruptHandlerManager> = None;
 
 /// CoreLock is a struct that is held when the cores are frozen, and released when the cores are unfrozen.
 /// Cores are frozen by scheduling a DPC on each core to raise the IRQL to DISPATCH_LEVEL, and then checked in.
@@ -129,6 +132,7 @@ fn raise_irql_to_dispatch(method: IrqlRaiseMethod) -> IrqlGuard {
             old_irql as u8
         },
     };
+
     IrqlGuard { old_irql, method }
 }
 
@@ -277,19 +281,38 @@ pub unsafe extern "C" fn device_ioctl_handler(
 
 enum CheckWriteMethod {
     WindowsApi,
-    CustomPageFaultHandler
+    CustomPageFaultHandler,
 }
 
-fn check_and_write(write_request: WriteRequest, method: CheckWriteMethod, mdl: Option<MyMDL>) -> Result<(), IoctlError> {
+fn check_and_write(
+    write_request: WriteRequest,
+    method: CheckWriteMethod,
+) -> Result<(), IoctlError> {
     match method {
         CheckWriteMethod::WindowsApi => check_and_write_windows(write_request),
-        CheckWriteMethod::CustomPageFaultHandler => check_and_write_page_fault(write_request, mdl.unwrap()),
+        CheckWriteMethod::CustomPageFaultHandler => check_and_write_page_fault(write_request),
     }
 }
 
-fn check_and_write_page_fault(write_request: WriteRequest, mdl: MyMDL) -> Result<(), IoctlError> {
+fn check_and_write_page_fault(write_request: WriteRequest) -> Result<(), IoctlError> {
     // Install our custom page fault handler
-    let mut handler_manager = PageFaultInterruptHandlerManager::new(mdl);
+    let mut handler_manager = {
+        // Check if we have one already, if so return a mutable reference
+        if let Some(manager) = unsafe { &mut PAGE_FAULT_MANAGER } {
+            // Ensure things are still paged in
+            manager.page_in_idt();
+            manager
+        } else {
+            // Pagein IDT
+            let mdl = interrupts::pagein_unprotect_idt();
+            // If we don't have one, create a new one and store it
+            let manager = PageFaultInterruptHandlerManager::new(mdl);
+            unsafe {
+                PAGE_FAULT_MANAGER = Some(manager);
+            }
+            unsafe { PAGE_FAULT_MANAGER.as_mut().unwrap() }
+        }
+    };
     handler_manager.install_interrupt_handler();
 
     let mut return_value = Ok(());
@@ -298,7 +321,7 @@ fn check_and_write_page_fault(write_request: WriteRequest, mdl: MyMDL) -> Result
     // If a page fault occurred, return an error
     for i in 0..write_request.buffer.len() {
         let address = write_request.untrusted_address + i;
-
+        PROBING_ADDRESS.store(address as u64, SeqCst);
         unsafe {
             core::ptr::write_volatile(address as *mut u8, write_request.buffer[i]);
         }
@@ -308,9 +331,11 @@ fn check_and_write_page_fault(write_request: WriteRequest, mdl: MyMDL) -> Result
         }
     }
 
+    PROBING_ADDRESS.store(0, SeqCst);
+
     // Restore the original page fault handler
     handler_manager.restore_interrupt_handler();
-    
+
     Ok(())
 }
 fn check_and_write_windows(write_request: WriteRequest) -> Result<(), IoctlError> {
@@ -330,7 +355,11 @@ fn check_and_write_windows(write_request: WriteRequest) -> Result<(), IoctlError
 
     // Copy buffer to address as requested by user.
     unsafe {
-        core::ptr::copy_nonoverlapping(write_request.buffer.as_ptr(), address as *mut u8, buffer_len);
+        core::ptr::copy_nonoverlapping(
+            write_request.buffer.as_ptr(),
+            address as *mut u8,
+            buffer_len,
+        );
     }
 
     Ok(())
@@ -388,8 +417,6 @@ fn handle_ioctl_request(
         // Freeze all other cores on the system to prevent any other threads from modifying the target process
         let _lock = freeze_all_cores();
         {
-            // Pagein IDT
-            let mdl = interrupts::pagein_unprotect_idt();
             // Raise our IRQL to prevent task-switching
             let _irql_guard = raise_irql_to_dispatch(IrqlRaiseMethod::RaiseIrqlDirect);
             // Modify our CR3 to the targets, backing up our original cr3
@@ -403,7 +430,7 @@ fn handle_ioctl_request(
                 buffer,
             };
 
-            check_and_write(write_request, CheckWriteMethod::CustomPageFaultHandler, Some(mdl))?;
+            check_and_write(write_request, CheckWriteMethod::CustomPageFaultHandler)?;
 
             // Restore our previous cr3
             unsafe {

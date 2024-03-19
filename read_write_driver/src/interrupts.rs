@@ -20,6 +20,8 @@ pub(crate) static PROBING_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) static mut CACHED_IDT: Option<SegmentTable> = None;
 
+static mut JUNK: u64 = 0;
+
 extern "C" {
     fn page_fault_handler();
 }
@@ -300,6 +302,8 @@ impl PageFaultInterruptHandlerManager {
             idt.replace_interrupt_handler(handler, self.current_vector);
             // Update the current handler address
             self.current_handler_address = handler;
+        } else {
+            panic!("Handler already installed");
         }
     }
 
@@ -366,6 +370,11 @@ pub unsafe extern "C" fn get_probing_address() -> u64 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn get_junk_pointer() -> *mut u64 {
+    addr_of_mut!(JUNK)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn get_previous_handler() -> u64 {
     return PREVIOUS_PAGE_FAULT_HANDLER.load(SeqCst) as u64;
 }
@@ -380,7 +389,6 @@ global_asm! {
     .extern get_previous_handler
     .global page_fault_handler
     page_fault_handler:
-        //int3
         // Check if the faulted address matches our global probing address
         push rax
         call get_probing_address
@@ -395,17 +403,25 @@ global_asm! {
         call get_previous_handler
         popfq
         jne .Lprevious_handler
-        // Spinloop
-        .Lspinloop:
-            int3
-            jmp .Lspinloop
+        .Lprobed_address:
+            call get_junk_pointer
+            mov rdx, rax
+            popfq
+            pop rax
+            iretq
         .Lprevious_handler:
             // Restore the previous handler
             popfq
-            // mov rax into -8 of the current stack pointer
-            mov QWORD PTR [rsp - 16], rax
+            // Enter the previous handler
+            call rax
             // Restore rax
             pop rax
-            jmp [rsp - 24]
+            // return
+            ret
+            // mov rax into -8 of the current stack pointer
+            //mov QWORD PTR [rsp - 16], rax
+            // Restore rax
+            //pop rax
+            //jmp [rsp - 24]
     "#
 }

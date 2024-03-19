@@ -323,7 +323,11 @@ fn check_and_write_page_fault(write_request: WriteRequest) -> Result<(), IoctlEr
         let address = write_request.untrusted_address + i;
         PROBING_ADDRESS.store(address as u64, SeqCst);
         unsafe {
-            core::ptr::write_volatile(address as *mut u8, write_request.buffer[i]);
+            asm!(
+            "mov [rdx], {}",
+            in(reg_byte) write_request.buffer[i],
+            in("rdx") address as u64,
+            );
         }
         if PAGE_FAULT_HIT.load(SeqCst) {
             return_value = Err(IoctlError::InvalidAddress);
@@ -336,7 +340,7 @@ fn check_and_write_page_fault(write_request: WriteRequest) -> Result<(), IoctlEr
     // Restore the original page fault handler
     handler_manager.restore_interrupt_handler();
 
-    Ok(())
+    return_value
 }
 fn check_and_write_windows(write_request: WriteRequest) -> Result<(), IoctlError> {
     let buffer_len = write_request.buffer.len();

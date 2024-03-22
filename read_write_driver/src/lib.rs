@@ -29,7 +29,6 @@ mod mdl;
 pub(crate) mod shared;
 
 use crate::interrupts::{PageFaultInterruptHandlerManager, PAGE_FAULT_HIT, PROBING_ADDRESS};
-use crate::mdl::MyMDL;
 use wdk_sys::{
     ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
     PCUNICODE_STRING,
@@ -74,24 +73,30 @@ impl Drop for PeProcessHandle {
 }
 
 #[derive(Copy, Clone)]
-enum IrqlRaiseMethod {
+enum IrqlMethod {
     RaiseIrql,
     RaiseIrqlDirect,
+    LowerIrql,
+    LowerIrqlDirect,
 }
 
 /// Wrapper around an old IRQL value (after a call to raise IRQL) that will lower the IRQL
 /// to its original value when dropped.
 struct IrqlGuard {
     old_irql: u8,
-    method: IrqlRaiseMethod,
+    method: IrqlMethod,
 }
 
 impl Drop for IrqlGuard {
     fn drop(&mut self) {
         unsafe {
             match self.method {
-                IrqlRaiseMethod::RaiseIrql => wdk_sys::ntddk::KeLowerIrql(self.old_irql),
-                IrqlRaiseMethod::RaiseIrqlDirect => {
+                IrqlMethod::RaiseIrql => wdk_sys::ntddk::KeLowerIrql(self.old_irql),
+                IrqlMethod::RaiseIrqlDirect => {
+                    asm!("mov cr8, {}", in(reg) self.old_irql as u64)
+                },
+                IrqlMethod::LowerIrql => { let _ = wdk_sys::ntddk::KfRaiseIrql(self.old_irql);},
+                IrqlMethod::LowerIrqlDirect => {
                     asm!("mov cr8, {}", in(reg) self.old_irql as u64)
                 }
             }
@@ -120,17 +125,41 @@ impl IoctlError {
 
 /// Raise the IRQL to DISPATCH_LEVEL and return an IrqlGuard that will lower the IRQL when dropped.
 /// The method used can be via the Windows API or by directly modifying cr8.
-fn raise_irql_to_dispatch(method: IrqlRaiseMethod) -> IrqlGuard {
+fn raise_irql_to_dispatch(method: IrqlMethod) -> IrqlGuard {
     let old_irql = match method {
-        IrqlRaiseMethod::RaiseIrql => unsafe {
+        IrqlMethod::RaiseIrql => unsafe {
             wdk_sys::ntddk::KfRaiseIrql(wdk_sys::DISPATCH_LEVEL as u8)
         },
-        IrqlRaiseMethod::RaiseIrqlDirect => unsafe {
+        IrqlMethod::RaiseIrqlDirect => unsafe {
             let old_irql: u64;
             asm!("mov {}, cr8", out(reg) old_irql);
             asm!("mov cr8, {}", in(reg) wdk_sys::DISPATCH_LEVEL as u64);
             old_irql as u8
         },
+        _ => {
+            panic!("Invalid method for raise_irql_to_dispatch")
+        }
+    };
+
+    IrqlGuard { old_irql, method }
+}
+
+fn lower_irql_to_passive(method: IrqlMethod) -> IrqlGuard {
+    let old_irql = match method {
+        IrqlMethod::LowerIrql => unsafe {
+            let old_irql = wdk_sys::ntddk::KeGetCurrentIrql();
+            wdk_sys::ntddk::KeLowerIrql(wdk_sys::PASSIVE_LEVEL as u8);
+            old_irql as u8
+        },
+        IrqlMethod::LowerIrqlDirect => unsafe {
+            let old_irql: u64;
+            asm!("mov {}, cr8", out(reg) old_irql);
+            asm!("mov cr8, {}", in(reg) wdk_sys::PASSIVE_LEVEL as u64);
+            old_irql as u8
+        },
+        _ => {
+            panic!("Invalid method for lower_irql_to_passive")
+        }
     };
 
     IrqlGuard { old_irql, method }
@@ -141,16 +170,16 @@ fn raise_irql_to_dispatch(method: IrqlRaiseMethod) -> IrqlGuard {
 impl Drop for CoreLock {
     fn drop(&mut self) {
         // Set the release flag
-        RELEASE_CORES.store(true, core::sync::atomic::Ordering::SeqCst);
+        RELEASE_CORES.store(true, SeqCst);
         // Wait for all cores to check out
-        while CORES_CHECKED_IN.load(core::sync::atomic::Ordering::SeqCst) > 0 {
+        while CORES_CHECKED_IN.load(SeqCst) > 0 {
             // Spin
         }
         // All cores have checked out, reset the release flag
-        RELEASE_CORES.store(false, core::sync::atomic::Ordering::SeqCst);
+        RELEASE_CORES.store(false, SeqCst);
 
         // Reset the core lock held flag
-        CORE_LOCK_HELD.store(false, core::sync::atomic::Ordering::SeqCst);
+        CORE_LOCK_HELD.store(false, SeqCst);
 
         // Free the allocated DPCs
         for dpc in self.allocated_dpcs.iter() {
@@ -210,7 +239,7 @@ pub unsafe extern "system" fn driver_entry(
     // Initialize the number of logical cores
     {
         let core_count = unsafe { KeQueryActiveProcessorCount(core::ptr::null_mut()) as usize };
-        NUM_LOGICAL_CORES.store(core_count, core::sync::atomic::Ordering::SeqCst);
+        NUM_LOGICAL_CORES.store(core_count, SeqCst);
     }
 
     // At this point we have a device and a symbolic link, return success
@@ -240,12 +269,12 @@ pub unsafe extern "C" fn device_ioctl_handler(
         shared::IOCTL_REQUEST => {
             // Matched on our IOCTL_REQUEST command. Check input buffer len and handle the request.
             // The input buffer should be at least the size of the ReadWriteIoctl struct
-            if input_buffer_len < core::mem::size_of::<shared::ReadWriteIoctl>() {
+            return if input_buffer_len < core::mem::size_of::<shared::ReadWriteIoctl>() {
                 // Input buffer is too small, return invalid buffer size
                 irp.IoStatus.__bindgen_anon_1.Status = wdk_sys::STATUS_INVALID_BUFFER_SIZE;
                 irp.IoStatus.Information = 0;
                 wdk_sys::ntddk::IofCompleteRequest(irp, 0);
-                return wdk_sys::STATUS_INVALID_BUFFER_SIZE;
+                wdk_sys::STATUS_INVALID_BUFFER_SIZE
             } else {
                 // Input buffer is large enough, handle the request.
                 // First, cast the input buffer to a ReadWriteIoctl struct
@@ -257,14 +286,14 @@ pub unsafe extern "C" fn device_ioctl_handler(
                         irp.IoStatus.__bindgen_anon_1.Status = wdk_sys::STATUS_SUCCESS;
                         irp.IoStatus.Information = 0;
                         wdk_sys::ntddk::IofCompleteRequest(irp, 0);
-                        return wdk_sys::STATUS_SUCCESS;
+                        wdk_sys::STATUS_SUCCESS
                     }
                     Err(e) => {
                         // Failed to handle the request, return invalid parameter
                         irp.IoStatus.__bindgen_anon_1.Status = e.status();
                         irp.IoStatus.Information = 0;
                         wdk_sys::ntddk::IofCompleteRequest(irp, 0);
-                        return wdk_sys::STATUS_INVALID_PARAMETER;
+                        wdk_sys::STATUS_INVALID_PARAMETER
                     }
                 }
             }
@@ -295,8 +324,12 @@ fn check_and_write(
 }
 
 fn check_and_write_page_fault(write_request: WriteRequest) -> Result<(), IoctlError> {
+
     // Install our custom page fault handler
-    let mut handler_manager = {
+    let handler_manager = {
+        // Temporarily lower IRQL to support page faults
+        let _irql_guard = lower_irql_to_passive(IrqlMethod::LowerIrqlDirect);
+        
         // Check if we have one already, if so return a mutable reference
         if let Some(manager) = unsafe { &mut PAGE_FAULT_MANAGER } {
             // Ensure things are still paged in
@@ -422,7 +455,7 @@ fn handle_ioctl_request(
         let _lock = freeze_all_cores();
         {
             // Raise our IRQL to prevent task-switching
-            let _irql_guard = raise_irql_to_dispatch(IrqlRaiseMethod::RaiseIrqlDirect);
+            let _irql_guard = raise_irql_to_dispatch(IrqlMethod::RaiseIrqlDirect);
             // Modify our CR3 to the targets, backing up our original cr3
             let old_cr3: usize;
             unsafe {
@@ -454,18 +487,18 @@ fn handle_ioctl_request(
 /// Freeze all cores on the system. Returns a `CoreLock` which will release the cores when dropped.
 fn freeze_all_cores() -> CoreLock {
     // Ensure the cores are not already locked, if not swap the lock to true
-    if CORE_LOCK_HELD.swap(true, core::sync::atomic::Ordering::SeqCst) {
+    if CORE_LOCK_HELD.swap(true, SeqCst) {
         panic!("Cores are already locked");
     }
     // Create a vector to store the allocated DPCs for cleanup
     let mut allocated_dpcs =
-        Vec::with_capacity(NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst));
+        Vec::with_capacity(NUM_LOGICAL_CORES.load(SeqCst));
 
     // For all cores (except the current core), Create a DPC with KeInitializeDpc and KeSetTargetProcessorDpc
     // to freeze the core. Then, wait for all cores to check in and return the CoreLock.
     let current_core =
         unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) } as usize;
-    for core in 0..NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst) {
+    for core in 0..NUM_LOGICAL_CORES.load(SeqCst) {
         if core != current_core {
             let tag = 0x647772;
             // Create a DPC for the core
@@ -502,8 +535,8 @@ fn freeze_all_cores() -> CoreLock {
         }
     }
     // Wait for all other cores to check in to ensure they are frozen before we proceed further
-    while CORES_CHECKED_IN.load(core::sync::atomic::Ordering::SeqCst)
-        < NUM_LOGICAL_CORES.load(core::sync::atomic::Ordering::SeqCst) - 1
+    while CORES_CHECKED_IN.load(SeqCst)
+        < NUM_LOGICAL_CORES.load(SeqCst) - 1
     {
         // Spin/wait
     }
@@ -520,15 +553,15 @@ unsafe extern "C" fn freeze_core(
     _system_argument2: *mut c_void,
 ) {
     // Raise IRQL to DISPATCH_LEVEL to prevent task-switching, ensuring our thread is the only one running on the core
-    let _irql_guard = raise_irql_to_dispatch(IrqlRaiseMethod::RaiseIrqlDirect);
+    let _irql_guard = raise_irql_to_dispatch(IrqlMethod::RaiseIrqlDirect);
     // Check in the core to indicate it is frozen
-    CORES_CHECKED_IN.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    CORES_CHECKED_IN.fetch_add(1, SeqCst);
     // Wait for the release signal
-    while !RELEASE_CORES.load(core::sync::atomic::Ordering::SeqCst) {
+    while !RELEASE_CORES.load(SeqCst) {
         // Spin/wait
     }
     // Release signal received, check-out the core as we will no longer freeze this core
-    CORES_CHECKED_IN.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    CORES_CHECKED_IN.fetch_sub(1, SeqCst);
 
     // irql_guard will be dropped, auto lowering the irql
 }
@@ -549,7 +582,7 @@ fn process_from_pid(pid: u32) -> Option<PeProcessHandle> {
 pub unsafe extern "C" fn device_unload(driver_obj: *mut DRIVER_OBJECT) {
     // Check if any cores are currently frozen, this should never happen.
     // If they are frozen, wait a little to see if they unfreeze and if not, panic.
-    if CORES_CHECKED_IN.load(core::sync::atomic::Ordering::SeqCst) > 0 {
+    if CORES_CHECKED_IN.load(SeqCst) > 0 {
         for _ in 0..1000 {
             // Spin
         }

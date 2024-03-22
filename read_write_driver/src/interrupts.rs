@@ -1,24 +1,19 @@
 use crate::mdl::{build_mdl, make_mdl_pages_writeable, MyMDL};
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::hint::black_box;
-use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering::SeqCst;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-use iced_x86::{Decoder, Instruction};
-
 pub(crate) static PAGE_FAULT_HIT: AtomicBool = AtomicBool::new(false);
 
 pub(crate) static PREVIOUS_PAGE_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) static PROBING_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) static mut CACHED_IDT: Option<SegmentTable> = None;
+pub(crate) static mut CACHED_IDT: Option<Arc<SegmentTable>> = None;
 
 static mut JUNK: u64 = 0;
 
@@ -96,31 +91,33 @@ pub(crate) struct IdtEntry64 {
 impl IdtEntry64 {
     fn replace_handler_address(&self, handler: &HandlerAddress) {
         let handler_address = handler.0;
-        let mut raw_entry = self.raw_entry.lock();
+        let raw_entry = self.raw_entry.lock();
 
         // Get the old handler address from the previous entry
-        let old_handler_address = unsafe {
-            let raw_entry_copy = core::ptr::read_volatile((*raw_entry));
+        let raw_entry_copy = unsafe {
+            core::ptr::read_volatile(*raw_entry)
+        };
+
+        let old_handler_address = {
             let offset_1 = raw_entry_copy.offset_1 as u64;
             let offset_2 = raw_entry_copy.offset_2 as u64;
             let offset_3 = raw_entry_copy.offset_3 as u64;
             offset_1 | (offset_2 << 16) | (offset_3 << 32)
         };
 
+        let new_entry = IdtEntry64Raw {
+            offset_1: handler_address as u16,
+            selector: raw_entry_copy.selector,
+            ist: raw_entry_copy.ist,
+            types_attr: raw_entry_copy.types_attr,
+            offset_2: (handler_address >> 16) as u16,
+            offset_3: (handler_address >> 32) as u32,
+            reserved: raw_entry_copy.reserved,
+        };
+
         // Replace the handler address in the IDT entry with the provided handler address.
         unsafe {
-            core::ptr::write_volatile(
-                addr_of_mut!((*(*raw_entry)).offset_1),
-                handler_address as u16,
-            );
-            core::ptr::write_volatile(
-                addr_of_mut!((*(*raw_entry)).offset_2),
-                (handler_address >> 16) as u16,
-            );
-            core::ptr::write_volatile(
-                addr_of_mut!((*(*raw_entry)).offset_3),
-                (handler_address >> 32) as u32,
-            );
+            core::ptr::write_volatile(*raw_entry, new_entry);
         }
 
         // Store the old handler address in our atomic global
@@ -183,21 +180,22 @@ impl InterruptHandler {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct SegmentTable {
-    raw: SegmentTableRaw,
-    obtained_entries: Vec<Arc<IdtEntry64>>,
+    base: AtomicU64,
+    limit: u16,
 }
 
 /// Generic Segment Table Format
 #[repr(C, packed(1))]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct SegmentTableRaw {
     pub(crate) limit: u16,
     pub(crate) base: u64,
 }
 
 impl SegmentTable {
-    fn replace_interrupt_handler(&mut self, handler: InterruptHandler, vector: u64) {
+    fn replace_interrupt_handler(&self, handler: InterruptHandler, vector: u64) {
         // Get the address of the IDT entry we need to replace based on the interrupt vector
         // from the provided InterruptHandler
         let idt_entry = self.get_idt_entry_for_vector(vector);
@@ -206,33 +204,24 @@ impl SegmentTable {
         idt_entry.replace_handler_address(&handler.handler_address());
     }
 
-    fn get_idt_entry_for_vector(&mut self, vector: u64) -> Arc<IdtEntry64> {
-        let segment_table_raw_ref = &self.raw;
+    fn get_idt_entry_for_vector(&self, vector: u64) -> Arc<IdtEntry64> {
         // Calculate the address of the IDT entry for the provided interrupt vector
         // by multiplying the vector by the size of an IdtEntry64
-        let idt_base = segment_table_raw_ref.base as *mut IdtEntry64Raw;
+        let idt_base = self.base.load(SeqCst) as *mut IdtEntry64Raw;
         let idt_target_entry = unsafe { idt_base.add(vector as usize) };
         // calculate the last valid entry to the IDT based on the IDT limit
         let idt_last_entry =
-            unsafe { (idt_base as *mut u8).add(segment_table_raw_ref.limit as usize) }
+            unsafe { (idt_base as *mut u8).add(self.limit as usize) }
                 as *mut IdtEntry64Raw;
         // Ensure the target entry is within the IDT limits
         if idt_target_entry > idt_last_entry {
             panic!("IDT entry for vector {} is out of bounds", vector as usize);
         } else {
-            let obtained_entries = &mut self.obtained_entries;
-            // Check if this entry has been obtained already, and if so return it
-            for entry in obtained_entries.iter() {
-                if entry.vector == vector {
-                    return entry.clone();
-                }
-            }
-            // If not, create a new IdtEntry64 and store it in the obtained_entries vector
+
             let new_entry = Arc::new(IdtEntry64 {
                 raw_entry: InterruptLock::new(idt_target_entry),
                 vector,
             });
-            obtained_entries.push(new_entry.clone());
 
             new_entry
         }
@@ -240,10 +229,9 @@ impl SegmentTable {
 }
 
 #[inline]
-pub(crate) fn idt() -> &'static mut SegmentTable {
-    // Return from the global cache if it's already been initialized
-    if let Some(cached_idt) = unsafe { &mut CACHED_IDT } {
-        return cached_idt;
+pub(crate) fn idt() -> Arc<SegmentTable> {
+    if let Some(cached_idt) = unsafe {&CACHED_IDT} {
+        return cached_idt.clone();
     }
     let mut table = SegmentTableRaw { base: 0, limit: 0 };
     unsafe {
@@ -251,13 +239,17 @@ pub(crate) fn idt() -> &'static mut SegmentTable {
     }
 
     let seg = SegmentTable {
-        raw: table,
-        obtained_entries: Vec::new(),
+        base: AtomicU64::new(table.base),
+        limit: table.limit,
     };
+
     unsafe {
-        CACHED_IDT = Some(seg);
+        CACHED_IDT.replace(Arc::new(seg));
+
+        CACHED_IDT.as_ref().unwrap().clone()
     }
-    unsafe { &mut *CACHED_IDT.as_mut().unwrap() }
+
+
 }
 
 pub(crate) struct PageFaultInterruptHandlerManager {
@@ -290,6 +282,11 @@ impl PageFaultInterruptHandlerManager {
     }
 
     pub(crate) fn install_interrupt_handler(&mut self) {
+        unsafe {
+            asm!(
+            "int3"
+            );
+        }
         let handler =
             InterruptHandler::PageFaultHandler(page_fault_handler, PageFaultVector::new());
         // Only replace the handler if it's different from the current handler
@@ -297,7 +294,7 @@ impl PageFaultInterruptHandlerManager {
             // Set previous
             self.previous_handler_address = Some(self.current_handler_address.handler_address().0);
             // Replace the current handler with the new handler
-            let mut idt = idt();
+            let idt = idt();
 
             idt.replace_interrupt_handler(handler, self.current_vector);
             // Update the current handler address
@@ -310,7 +307,7 @@ impl PageFaultInterruptHandlerManager {
     pub(crate) fn restore_interrupt_handler(&mut self) {
         if let Some(previous_handler_address) = self.previous_handler_address {
             let previous_handler = InterruptHandler::Unknown(previous_handler_address);
-            let mut idt = idt();
+            let idt = idt();
             idt.replace_interrupt_handler(previous_handler, self.current_vector);
             self.current_handler_address = previous_handler;
             self.previous_handler_address = None;
@@ -322,8 +319,8 @@ impl PageFaultInterruptHandlerManager {
 
     pub(crate) fn page_in_idt(&self) {
         let idt = idt();
-        let idt_base = idt.raw.base as *mut IdtEntry64Raw;
-        let idt_last_entry = unsafe { (idt_base as *mut u8).add(idt.raw.limit as usize) };
+        let idt_base = idt.base.load(SeqCst) as *mut IdtEntry64Raw;
+        let idt_last_entry = unsafe { (idt_base as *mut u8).add(idt.limit as usize) };
 
         for entry in ((idt_base as u64)..(idt_last_entry as u64))
             .step_by(core::mem::size_of::<IdtEntry64Raw>())
@@ -338,19 +335,17 @@ impl PageFaultInterruptHandlerManager {
 pub(crate) fn pagein_unprotect_idt() -> MyMDL {
     // Get the IDT and read every entry up to the limit to ensure they are paged in
     let idt = idt();
-    let idt_base = idt.raw.base as *mut IdtEntry64Raw;
-    let idt_last_entry = unsafe { (idt_base as *mut u8).add(idt.raw.limit as usize) };
-    // Perform a volatile read
+    let idt_base = idt.base.load(SeqCst) as *mut IdtEntry64Raw;
     unsafe {
         // Get an MDL that describes the entire IDT table
-        let mdl = build_mdl(idt_base as u64, idt.raw.limit as u64).unwrap();
+        let mdl = build_mdl(idt_base as u64, idt.limit as u64).unwrap();
         // Mark the entire MDL as RWX
         make_mdl_pages_writeable(&mdl);
 
         // Modify the base with the one from our MDL
-        idt.raw.base = mdl.mapped_base;
-        let idt_base = idt.raw.base as *mut IdtEntry64Raw;
-        let idt_last_entry = unsafe { (idt_base as *mut u8).add(idt.raw.limit as usize) };
+        idt.base.store(mdl.mapped_base, SeqCst);
+        let idt_base = idt.base.load(SeqCst) as *mut IdtEntry64Raw;
+        let idt_last_entry = (idt_base as *mut u8).add(idt.limit as usize);
 
         for entry in ((idt_base as u64)..(idt_last_entry as u64))
             .step_by(core::mem::size_of::<IdtEntry64Raw>())
@@ -382,13 +377,13 @@ pub unsafe extern "C" fn get_previous_handler() -> u64 {
 // global_asm block of our page fault handler
 global_asm! {
     r#"
-    .intel_syntax noprefix
     .section .text
     .align 16
     .extern get_probing_address
     .extern get_previous_handler
     .global page_fault_handler
     page_fault_handler:
+        int3
         // Check if the faulted address matches our global probing address
         push rax
         call get_probing_address

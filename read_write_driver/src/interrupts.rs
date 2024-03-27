@@ -1,5 +1,7 @@
 use crate::mdl::{build_mdl, make_mdl_pages_writeable, MyMDL};
 use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::hint::black_box;
@@ -13,7 +15,7 @@ pub(crate) static PREVIOUS_PAGE_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0)
 
 pub(crate) static PROBING_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) static mut CACHED_IDT: Option<Arc<SegmentTable>> = None;
+pub(crate) static mut CACHED_IDT: Option<Vec<Arc<SegmentTable>>> = None;
 
 static mut JUNK: u64 = 0;
 
@@ -94,9 +96,7 @@ impl IdtEntry64 {
         let raw_entry = self.raw_entry.lock();
 
         // Get the old handler address from the previous entry
-        let raw_entry_copy = unsafe {
-            core::ptr::read_volatile(*raw_entry)
-        };
+        let raw_entry_copy = unsafe { core::ptr::read_volatile(*raw_entry) };
 
         let old_handler_address = {
             let offset_1 = raw_entry_copy.offset_1 as u64;
@@ -117,6 +117,11 @@ impl IdtEntry64 {
 
         // Replace the handler address in the IDT entry with the provided handler address.
         unsafe {
+            // First, flush the cache containing the raw_entry address using clflush
+            // Call this for every 8 bytes of the raw_entry address (based on size of IdtEntry64Raw)
+            asm!("wbinvd");
+            // Synchronize
+            asm!("mfence");
             core::ptr::write_volatile(*raw_entry, new_entry);
         }
 
@@ -156,10 +161,28 @@ impl Default for PageFaultVector {
 #[derive(Copy, Clone)]
 struct HandlerAddress(u64);
 
-#[derive(Eq, PartialEq, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub(crate) enum InterruptHandler {
     PageFaultHandler(unsafe extern "C" fn(), PageFaultVector),
     Unknown(u64),
+}
+
+impl PartialEq for InterruptHandler {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                InterruptHandler::PageFaultHandler(handler, vector),
+                InterruptHandler::PageFaultHandler(other_handler, other_vector),
+            ) => {
+                handler as *const _ as u64 == other_handler as *const _ as u64
+                    && vector == other_vector
+            }
+            (InterruptHandler::Unknown(address), InterruptHandler::Unknown(other_address)) => {
+                address == other_address
+            }
+            _ => false,
+        }
+    }
 }
 
 impl InterruptHandler {
@@ -182,6 +205,7 @@ impl InterruptHandler {
 
 #[derive(Debug)]
 pub(crate) struct SegmentTable {
+    original_base: AtomicU64,
     base: AtomicU64,
     limit: u16,
 }
@@ -211,13 +235,11 @@ impl SegmentTable {
         let idt_target_entry = unsafe { idt_base.add(vector as usize) };
         // calculate the last valid entry to the IDT based on the IDT limit
         let idt_last_entry =
-            unsafe { (idt_base as *mut u8).add(self.limit as usize) }
-                as *mut IdtEntry64Raw;
+            unsafe { (idt_base as *mut u8).add(self.limit as usize) } as *mut IdtEntry64Raw;
         // Ensure the target entry is within the IDT limits
         if idt_target_entry > idt_last_entry {
             panic!("IDT entry for vector {} is out of bounds", vector as usize);
         } else {
-
             let new_entry = Arc::new(IdtEntry64 {
                 raw_entry: InterruptLock::new(idt_target_entry),
                 vector,
@@ -230,26 +252,39 @@ impl SegmentTable {
 
 #[inline]
 pub(crate) fn idt() -> Arc<SegmentTable> {
-    if let Some(cached_idt) = unsafe {&CACHED_IDT} {
-        return cached_idt.clone();
-    }
     let mut table = SegmentTableRaw { base: 0, limit: 0 };
     unsafe {
         asm!("sidt [{}]", in(reg) &mut table);
     }
 
+    if let Some(cached_idt) = unsafe { &CACHED_IDT } {
+        // If we find an existing entry with the same original base, return it.
+        // We check this as we may be executing on different cores, and each core has its
+        // own IDT.
+        for entry in cached_idt.iter() {
+            if entry.original_base.load(SeqCst) == table.base {
+                return entry.clone();
+            }
+        }
+    }
+    // No match, create a new entry
     let seg = SegmentTable {
+        original_base: AtomicU64::new(table.base),
         base: AtomicU64::new(table.base),
         limit: table.limit,
     };
 
     unsafe {
-        CACHED_IDT.replace(Arc::new(seg));
+        // Add the entry to the global cache
+        let arc_entry = Arc::new(seg);
+        if let Some(cached_idt) = &mut CACHED_IDT {
+            cached_idt.push(arc_entry.clone());
+        } else {
+            CACHED_IDT = Some(vec![arc_entry.clone()]);
+        }
 
-        CACHED_IDT.as_ref().unwrap().clone()
+        arc_entry
     }
-
-
 }
 
 pub(crate) struct PageFaultInterruptHandlerManager {
@@ -257,10 +292,11 @@ pub(crate) struct PageFaultInterruptHandlerManager {
     current_vector: u64,
     previous_handler_address: Option<u64>,
     mdl: MyMDL,
+    pub(crate) core_id: u64,
 }
 
 impl PageFaultInterruptHandlerManager {
-    pub(crate) fn new(mdl: MyMDL) -> Self {
+    pub(crate) fn new(mdl: MyMDL, core: u64) -> Self {
         // Get the address of the current interrupt handler by reading it from the IDT
         let current_handler_idt = idt().get_idt_entry_for_vector(InterruptVector::PageFault as u64);
         // Construct the address of the entry
@@ -278,14 +314,13 @@ impl PageFaultInterruptHandlerManager {
             current_vector: InterruptVector::PageFault as u64,
             previous_handler_address: None,
             mdl,
+            core_id: core,
         }
     }
 
     pub(crate) fn install_interrupt_handler(&mut self) {
         unsafe {
-            asm!(
-            "int3"
-            );
+            asm!("int3");
         }
         let handler =
             InterruptHandler::PageFaultHandler(page_fault_handler, PageFaultVector::new());
@@ -370,6 +405,11 @@ pub unsafe extern "C" fn get_junk_pointer() -> *mut u64 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn set_page_fault_hit() {
+    PAGE_FAULT_HIT.store(true, SeqCst);
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn get_previous_handler() -> u64 {
     return PREVIOUS_PAGE_FAULT_HANDLER.load(SeqCst) as u64;
 }
@@ -381,31 +421,96 @@ global_asm! {
     .align 16
     .extern get_probing_address
     .extern get_previous_handler
+    .extern set_page_fault_hit
     .global page_fault_handler
     page_fault_handler:
-        int3
         // Check if the faulted address matches our global probing address
-        push rax
+        push rax // Original rax
+        pushfq // Original rflags
+        push rcx // Original rcx
+        push rdx // Original rdx
+        push r8 // Original r8
+        push r9 // Original r9
+        push r10 // Original r10
+        push r11 // Original r11
+        // backup XMM0-XMM5
+         sub    rsp, 16
+        movdqu [rsp], xmm0
+        sub   rsp, 16
+        movdqu [rsp], xmm1
+        sub   rsp, 16
+        movdqu [rsp], xmm2
+        sub   rsp, 16
+        movdqu [rsp], xmm3
+        sub   rsp, 16
+        movdqu [rsp], xmm4
+        sub   rsp, 16
+        movdqu [rsp], xmm5
+        call get_previous_handler
+        push rax // get_previous_handler result
         call get_probing_address
-        pushfq
         // Check if the address is a match, if not then jmp to the previous handler
         // If so, then spinloop for now
         push rdx
         mov rdx, cr2
         cmp rax, rdx
         pop rdx
-        pushfq
-        call get_previous_handler
-        popfq
         jne .Lprevious_handler
         .Lprobed_address:
             call get_junk_pointer
             mov rdx, rax
+            push rdx // save rdx (junk pointer)
+            call set_page_fault_hit
+            pop rdx // restore junk pointer
+            // Restore the previous handler
+            pop rax // pop the previous handler from stack
+            // Restore all saved registers except rax
+            movdqu xmm5, [rsp]
+            add    rsp, 16
+            movdqu xmm4, [rsp]
+            add    rsp, 16
+            movdqu xmm3, [rsp]
+            add    rsp, 16
+            movdqu xmm2, [rsp]
+            add    rsp, 16
+            movdqu xmm1, [rsp]
+            add    rsp, 16
+            movdqu xmm0, [rsp]
+            add    rsp, 16
+            pop r11
+            pop r10
+            pop r9
+            pop r8
+            // Skip over rdx, as we've modified it
+            add rsp, 8
+            pop rcx
             popfq
-            pop rax
+            pop rax // restore rax
+            // "pop" off the error code
+            add rsp, 8
             iretq
         .Lprevious_handler:
             // Restore the previous handler
+            pop rax // pop the previous handler from stack
+            // Restore all saved registers except rax
+            movdqu xmm5, [rsp]
+            add    rsp, 16
+            movdqu xmm4, [rsp]
+            add    rsp, 16
+            movdqu xmm3, [rsp]
+            add    rsp, 16
+            movdqu xmm2, [rsp]
+            add    rsp, 16
+            movdqu xmm1, [rsp]
+            add    rsp, 16
+            movdqu xmm0, [rsp]
+            add    rsp, 16
+            pop r11
+            pop r10
+            pop r9
+            pop r8
+            pop rdx
+            pop rcx
             popfq
             // Enter the previous handler
             call rax

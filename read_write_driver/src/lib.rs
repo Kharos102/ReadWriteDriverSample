@@ -5,6 +5,7 @@
 #[cfg(not(test))]
 extern crate wdk_panic;
 
+use alloc::vec;
 use core::{
     arch::asm,
     ffi::c_void,
@@ -50,7 +51,7 @@ static CORES_CHECKED_IN: AtomicUsize = AtomicUsize::new(0);
 /// Flag indicating if the global core lock is held, used when freezing cores
 static CORE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
 
-static mut PAGE_FAULT_MANAGER: Option<PageFaultInterruptHandlerManager> = None;
+static mut PAGE_FAULT_MANAGER: Option<Vec<PageFaultInterruptHandlerManager>> = None;
 
 /// CoreLock is a struct that is held when the cores are frozen, and released when the cores are unfrozen.
 /// Cores are frozen by scheduling a DPC on each core to raise the IRQL to DISPATCH_LEVEL, and then checked in.
@@ -94,8 +95,10 @@ impl Drop for IrqlGuard {
                 IrqlMethod::RaiseIrql => wdk_sys::ntddk::KeLowerIrql(self.old_irql),
                 IrqlMethod::RaiseIrqlDirect => {
                     asm!("mov cr8, {}", in(reg) self.old_irql as u64)
-                },
-                IrqlMethod::LowerIrql => { let _ = wdk_sys::ntddk::KfRaiseIrql(self.old_irql);},
+                }
+                IrqlMethod::LowerIrql => {
+                    let _ = wdk_sys::ntddk::KfRaiseIrql(self.old_irql);
+                }
                 IrqlMethod::LowerIrqlDirect => {
                     asm!("mov cr8, {}", in(reg) self.old_irql as u64)
                 }
@@ -296,7 +299,7 @@ pub unsafe extern "C" fn device_ioctl_handler(
                         wdk_sys::STATUS_INVALID_PARAMETER
                     }
                 }
-            }
+            };
         }
         _ => {
             // Unsupported IOCTL command, return invalid device request
@@ -324,27 +327,46 @@ fn check_and_write(
 }
 
 fn check_and_write_page_fault(write_request: WriteRequest) -> Result<(), IoctlError> {
-
     // Install our custom page fault handler
     let handler_manager = {
         // Temporarily lower IRQL to support page faults
         let _irql_guard = lower_irql_to_passive(IrqlMethod::LowerIrqlDirect);
-        
+        let current_core =
+            unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) };
+        let mut handler_manager = None;
         // Check if we have one already, if so return a mutable reference
         if let Some(manager) = unsafe { &mut PAGE_FAULT_MANAGER } {
-            // Ensure things are still paged in
-            manager.page_in_idt();
-            manager
-        } else {
+            // Attempt to find a manager with the same core_id as us
+            let current_core =
+                unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) };
+            for manager in manager.iter_mut() {
+                if manager.core_id == current_core as u64 {
+                    // Ensure things are still paged in
+                    manager.page_in_idt();
+                    handler_manager = Some(manager);
+                    break;
+                }
+            }
+        }
+        if handler_manager.is_none() {
             // Pagein IDT
             let mdl = interrupts::pagein_unprotect_idt();
             // If we don't have one, create a new one and store it
-            let manager = PageFaultInterruptHandlerManager::new(mdl);
+            let manager = PageFaultInterruptHandlerManager::new(mdl, current_core as u64);
+            // Add the manager to the global vector
             unsafe {
-                PAGE_FAULT_MANAGER = Some(manager);
+                if let Some(manager_vec) = &mut PAGE_FAULT_MANAGER {
+                    manager_vec.push(manager);
+                } else {
+                    PAGE_FAULT_MANAGER = Some(vec![manager]);
+                }
             }
-            unsafe { PAGE_FAULT_MANAGER.as_mut().unwrap() }
+            // Set handler_manager to the newly created manager
+            handler_manager =
+                Some(unsafe { PAGE_FAULT_MANAGER.as_mut().unwrap().last_mut().unwrap() });
         }
+
+        handler_manager.unwrap()
     };
     handler_manager.install_interrupt_handler();
 
@@ -402,6 +424,63 @@ fn check_and_write_windows(write_request: WriteRequest) -> Result<(), IoctlError
     Ok(())
 }
 
+fn switch_cr3(new_cr3: usize) -> Cr3SwitchGuard {
+    let previous_cr3 = unsafe {
+        let mut previous_cr3: usize = 0;
+        asm!(
+            "mov {}, cr3",
+            out(reg) previous_cr3,
+        );
+        asm!(
+            "mov cr3, {}",
+            in(reg) new_cr3,
+        );
+        previous_cr3
+    };
+
+    Cr3SwitchGuard { previous_cr3 }
+}
+
+struct Cr3SwitchGuard {
+    previous_cr3: usize,
+}
+
+impl Drop for Cr3SwitchGuard {
+    fn drop(&mut self) {
+        unsafe {
+            asm!(
+                "mov cr3, {}",
+                in(reg) self.previous_cr3,
+            );
+        }
+    }
+}
+
+struct CorePin {
+    previous_affinity: u64,
+}
+
+// Impl new on CorePin that will pin the current thread to the current core
+impl CorePin {
+    fn new() -> CorePin {
+        let previous_affinity = unsafe {
+            let current_core = wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut());
+            let mask = 1 << current_core;
+            wdk_sys::ntddk::KeSetSystemAffinityThreadEx(mask)
+        };
+        CorePin { previous_affinity }
+    }
+}
+
+// Impl drop on CorePin that will restore the previous affinity when dropped
+impl Drop for CorePin {
+    fn drop(&mut self) {
+        unsafe {
+            wdk_sys::ntddk::KeRevertToUserAffinityThreadEx(self.previous_affinity);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WriteRequest<'a> {
     untrusted_address: usize,
@@ -417,6 +496,11 @@ fn handle_ioctl_request(
     let header = &ioctl_request.header;
     let address = header.address;
     let buffer_len = header.buffer_len;
+
+    // Pin the executing thread to the current core, as we mess with IDTs later
+    // we want to ensure we're not task-switched to another core with a separate IDT.
+    // This will auto-revert when dropped (end of function)
+    let _core_pin = CorePin::new();
 
     // If we're attempting to write 0 bytes, we can just return success now
     if buffer_len == 0 {
@@ -457,11 +541,9 @@ fn handle_ioctl_request(
             // Raise our IRQL to prevent task-switching
             let _irql_guard = raise_irql_to_dispatch(IrqlMethod::RaiseIrqlDirect);
             // Modify our CR3 to the targets, backing up our original cr3
-            let old_cr3: usize;
-            unsafe {
-                asm!("mov {}, cr3", out(reg) old_cr3);
-                asm!("mov cr3, {}", in(reg) cr3);
-            }
+            // and auto-restoring on drop
+            let _cr3_guard = switch_cr3(cr3);
+
             let write_request = WriteRequest {
                 untrusted_address: address,
                 buffer,
@@ -469,12 +551,8 @@ fn handle_ioctl_request(
 
             check_and_write(write_request, CheckWriteMethod::CustomPageFaultHandler)?;
 
-            // Restore our previous cr3
-            unsafe {
-                asm!("mov cr3, {}", in(reg) old_cr3);
-            }
-
-            // irql_guard will be dropped, auto lowering the irql
+            // irql_guard and cr3_guard will be dropped (or dropped already if check_and_write
+            // threw an error), auto lowering the irql and restoring the cr3
         }
 
         // _lock will be dropped, auto releasing the cores
@@ -491,37 +569,47 @@ fn freeze_all_cores() -> CoreLock {
         panic!("Cores are already locked");
     }
     // Create a vector to store the allocated DPCs for cleanup
-    let mut allocated_dpcs =
-        Vec::with_capacity(NUM_LOGICAL_CORES.load(SeqCst));
+    let mut allocated_dpcs = Vec::with_capacity(NUM_LOGICAL_CORES.load(SeqCst));
 
-    // For all cores (except the current core), Create a DPC with KeInitializeDpc and KeSetTargetProcessorDpc
-    // to freeze the core. Then, wait for all cores to check in and return the CoreLock.
-    let current_core =
-        unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) } as usize;
-    for core in 0..NUM_LOGICAL_CORES.load(SeqCst) {
-        if core != current_core {
-            let tag = 0x647772;
-            // Create a DPC for the core
-            // The DPC should be allocated from NonPagedPool, allocate it using ExAllocatePool2
-            let dpc = unsafe {
-                let buffer = wdk_sys::ntddk::ExAllocatePool2(
-                    wdk_sys::POOL_FLAG_NON_PAGED,
-                    core::mem::size_of::<wdk_sys::KDPC>() as u64,
-                    tag,
-                ) as *mut wdk_sys::KDPC;
+    for _core in 0..(NUM_LOGICAL_CORES.load(SeqCst) - 1) {
+        let tag = 0x647772;
+        // Create a DPC for the core
+        // The DPC should be allocated from NonPagedPool, allocate it using ExAllocatePool2
+        unsafe {
+            let buffer = wdk_sys::ntddk::ExAllocatePool2(
+                wdk_sys::POOL_FLAG_NON_PAGED,
+                core::mem::size_of::<wdk_sys::KDPC>() as u64,
+                tag,
+            ) as *mut wdk_sys::KDPC;
 
-                // Assert the buffer is non-null
-                assert_ne!(buffer, core::ptr::null_mut());
-                // Write a default KDPC to the buffer
-                core::ptr::write(buffer, wdk_sys::KDPC::default());
+            // Assert the buffer is non-null
+            assert_ne!(buffer, core::ptr::null_mut());
+            // Write a default KDPC to the buffer
+            core::ptr::write(buffer, wdk_sys::KDPC::default());
 
-                // Store the allocated DPC for cleanup
-                allocated_dpcs.push(buffer);
+            // Store the allocated DPC for cleanup
+            allocated_dpcs.push(buffer);
+        };
+    }
 
-                // Send up the default non-paged initialized KDPC
-                buffer
-            };
+    {
+        // Temporarily raise to dispatch to prevent being rescheduled onto a different core
+        let _irql_guard = raise_irql_to_dispatch(IrqlMethod::RaiseIrqlDirect);
+        // Don't freeze the current core
+        let current_core =
+            unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) }
+                as usize;
 
+        // Clone the allocated_dpcs as we're going to temporarily pop them
+        let mut allocated_dpcs_clone = allocated_dpcs.clone();
+        // Create a DPC for NUM_LOGICAL_CORES - 1 (skipping the current core)
+        for core in 0..NUM_LOGICAL_CORES.load(SeqCst) {
+            // If its the current core, skip
+            if core == current_core {
+                continue;
+            }
+            // If its not, pop a DPC out of the allocated_dpcs_clone
+            let dpc = allocated_dpcs_clone.pop().expect("Failed to pop DPC");
             // Initialize the DPC
             unsafe {
                 wdk_sys::ntddk::KeInitializeDpc(dpc, Some(freeze_core), core::ptr::null_mut());
@@ -534,10 +622,9 @@ fn freeze_all_cores() -> CoreLock {
             }
         }
     }
+
     // Wait for all other cores to check in to ensure they are frozen before we proceed further
-    while CORES_CHECKED_IN.load(SeqCst)
-        < NUM_LOGICAL_CORES.load(SeqCst) - 1
-    {
+    while CORES_CHECKED_IN.load(SeqCst) < NUM_LOGICAL_CORES.load(SeqCst) - 1 {
         // Spin/wait
     }
     // All cores have checked in, return the CoreLock

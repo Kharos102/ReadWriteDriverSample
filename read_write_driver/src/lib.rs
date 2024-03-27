@@ -1,5 +1,5 @@
-#![feature(abi_x86_interrupt)]
 #![feature(new_uninit)]
+#![feature(negative_impls)]
 #![no_std]
 
 #[cfg(not(test))]
@@ -25,11 +25,14 @@ extern crate alloc;
 
 pub(crate) mod uni;
 
+mod device_ctx;
 mod interrupts;
+mod locking;
 mod mdl;
 pub(crate) mod shared;
 
 use crate::interrupts::{PageFaultInterruptHandlerManager, PAGE_FAULT_HIT, PROBING_ADDRESS};
+use crate::locking::{CoreLock, CorePin, CORES_CHECKED_IN, CORE_LOCK_HELD, RELEASE_CORES};
 use wdk_sys::{
     ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
     PCUNICODE_STRING,
@@ -42,23 +45,7 @@ const DOS_DEVICE_NAME_PATH: &str = "\\DosDevices\\ReadWriteDevice";
 /// Number of logical cores (NUM_LOGICAL_CORES) on the system using OnceLock and KeQueryActiveProcessorCount
 static NUM_LOGICAL_CORES: AtomicUsize = AtomicUsize::new(0);
 
-/// Flag indicating if the cores should be released
-static RELEASE_CORES: AtomicBool = AtomicBool::new(false);
-
-/// Number of cores currently checked-in / on hold when freezing cores
-static CORES_CHECKED_IN: AtomicUsize = AtomicUsize::new(0);
-
-/// Flag indicating if the global core lock is held, used when freezing cores
-static CORE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
-
 static mut PAGE_FAULT_MANAGER: Option<Vec<PageFaultInterruptHandlerManager>> = None;
-
-/// CoreLock is a struct that is held when the cores are frozen, and released when the cores are unfrozen.
-/// Cores are frozen by scheduling a DPC on each core to raise the IRQL to DISPATCH_LEVEL, and then checked in.
-/// We track all allocated DPCs so that we can free them when the CoreLock is dropped.
-struct CoreLock {
-    allocated_dpcs: Vec<*mut wdk_sys::KDPC>,
-}
 
 /// Wrapper around the PEPROCESS handle to ensure it is dereferenced when dropped
 struct PeProcessHandle {
@@ -166,31 +153,6 @@ fn lower_irql_to_passive(method: IrqlMethod) -> IrqlGuard {
     };
 
     IrqlGuard { old_irql, method }
-}
-
-// Impl drop for corelock that will set the release cores flag to true, wait for
-// all cores to check out, and then reset the core lock held flag.
-impl Drop for CoreLock {
-    fn drop(&mut self) {
-        // Set the release flag
-        RELEASE_CORES.store(true, SeqCst);
-        // Wait for all cores to check out
-        while CORES_CHECKED_IN.load(SeqCst) > 0 {
-            // Spin
-        }
-        // All cores have checked out, reset the release flag
-        RELEASE_CORES.store(false, SeqCst);
-
-        // Reset the core lock held flag
-        CORE_LOCK_HELD.store(false, SeqCst);
-
-        // Free the allocated DPCs
-        for dpc in self.allocated_dpcs.iter() {
-            unsafe {
-                wdk_sys::ntddk::ExFreePool(*dpc as *mut c_void);
-            }
-        }
-    }
 }
 
 #[export_name = "DriverEntry"] // WDF expects a symbol with the name DriverEntry
@@ -456,31 +418,6 @@ impl Drop for Cr3SwitchGuard {
     }
 }
 
-struct CorePin {
-    previous_affinity: u64,
-}
-
-// Impl new on CorePin that will pin the current thread to the current core
-impl CorePin {
-    fn new() -> CorePin {
-        let previous_affinity = unsafe {
-            let current_core = wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut());
-            let mask = 1 << current_core;
-            wdk_sys::ntddk::KeSetSystemAffinityThreadEx(mask)
-        };
-        CorePin { previous_affinity }
-    }
-}
-
-// Impl drop on CorePin that will restore the previous affinity when dropped
-impl Drop for CorePin {
-    fn drop(&mut self) {
-        unsafe {
-            wdk_sys::ntddk::KeRevertToUserAffinityThreadEx(self.previous_affinity);
-        }
-    }
-}
-
 #[derive(Clone)]
 struct WriteRequest<'a> {
     untrusted_address: usize,
@@ -628,7 +565,7 @@ fn freeze_all_cores() -> CoreLock {
         // Spin/wait
     }
     // All cores have checked in, return the CoreLock
-    CoreLock { allocated_dpcs }
+    CoreLock::new(allocated_dpcs)
 }
 
 /// Freezes a core by raising the IRQL to DISPATCH_LEVEL, checking in the core and waiting for the release signal.

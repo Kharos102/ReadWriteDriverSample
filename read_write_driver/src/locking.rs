@@ -3,15 +3,23 @@
 // goes out of scope. Uses Atomics and a ticket approach to obtain the lock
 // and ensure callers are provided access in the order they requested it.
 
-use crate::device_ctx::Ctx;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::panic::Location;
 use core::sync::atomic::Ordering::SeqCst;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use once_cell::sync::Lazy;
 use wdk_sys::ntddk::{KeRevertToUserAffinityThreadEx, KeSetSystemAffinityThreadEx, __rdtsc};
+
+/// Flag indicating if the cores should be released
+pub static RELEASE_CORES: AtomicBool = AtomicBool::new(false);
+
+/// Number of cores currently checked-in / on hold when freezing cores
+pub static CORES_CHECKED_IN: AtomicUsize = AtomicUsize::new(0);
+
+/// Flag indicating if the global core lock is held, used when freezing cores
+pub static CORE_LOCK_HELD: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LockError {
@@ -19,12 +27,22 @@ pub enum LockError {
     CoreNotPinned,
 }
 
-pub struct PinnedCore {
+static PINNED_CORES: Lazy<[QueuedLock<PinnedCore>; 64]> = Lazy::new(|| {
+    let pinned_cores = core::array::from_fn(|_| {
+        QueuedLock::new(PinnedCore {
+            core_id: AtomicUsize::new(0),
+            is_pinned: AtomicBool::new(false),
+        })
+    });
+
+    pinned_cores
+});
+
+struct PinnedCore {
     core_id: AtomicUsize,
-    previous_affinity: AtomicU64,
+    is_pinned: AtomicBool,
 }
 
-#[derive(Default)]
 pub struct QueuedLock<T> {
     ticket: AtomicUsize,
     serving: AtomicUsize,
@@ -105,29 +123,27 @@ impl<T> core::ops::DerefMut for QueuedLockGuard<'_, T> {
     }
 }
 
-// Don't impl send or sync for CorePin
-impl !Send for CorePin {}
-impl !Sync for CorePin {}
-
 pub struct CorePin {
-    ctx: *const Ctx,
+    previous_affinity: AtomicU64,
 }
 
 // Impl new on CorePin that will pin the current thread to the current core
 impl CorePin {
-    pub fn new(ctx: &Ctx) -> Result<CorePin, LockError> {
+    pub fn new() -> Result<CorePin, LockError> {
         let current_core = unsafe {
             wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) as usize
         };
-        pin_to_core(current_core, ctx)?;
-        Ok(CorePin { ctx })
+        let previous_affinity = pin_to_core(current_core)?;
+        Ok(CorePin {
+            previous_affinity: AtomicU64::new(previous_affinity),
+        })
     }
 }
 
 // Impl drop on CorePin that will restore the previous affinity when dropped
 impl Drop for CorePin {
     fn drop(&mut self) {
-        unpin_core().expect("Failed to unpin core");
+        unpin_core(self.previous_affinity.load(SeqCst)).expect("Failed to unpin core");
     }
 }
 
@@ -169,49 +185,36 @@ impl Drop for CoreLock {
     }
 }
 
-pub fn pin_to_core(core_id: usize, ctx: &Ctx) -> Result<(), LockError> {
-    let mut pinned_cores = ctx.pinned_cores.lock();
-    // Check if an entry already exists for the target core by enumerating the Vec
-    for pinned_core in pinned_cores.iter() {
-        if pinned_core.core_id.load(SeqCst) == core_id {
-            return Err(LockError::CoreAlreadyPinned);
-        }
+pub fn pin_to_core(core_id: usize) -> Result<u64, LockError> {
+    let target_core_lock = &PINNED_CORES[core_id];
+    let target_core = target_core_lock.lock();
+    if target_core
+        .is_pinned
+        .compare_exchange(false, true, SeqCst, SeqCst)
+        .is_err()
+    {
+        return Err(LockError::CoreAlreadyPinned);
     }
-
-    // Pin our core
+    target_core.core_id.store(core_id, SeqCst);
     let previous_affinity = unsafe { KeSetSystemAffinityThreadEx(1 << core_id) };
-
-    let target_core = PinnedCore {
-        core_id: AtomicUsize::new(core_id),
-        previous_affinity: AtomicU64::new(previous_affinity),
-    };
-    // Add it to the Vec
-    pinned_cores.push(target_core);
-
-    Ok(())
+    Ok(previous_affinity)
 }
 
-pub fn unpin_core(ctx: &Ctx) -> Result<(), LockError> {
+pub fn unpin_core(previous_affinity: u64) -> Result<(), LockError> {
     // We can only unpin the current core
     let core_id =
         unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) as usize };
-    let mut pinned_cores = ctx.pinned_cores.lock();
-    // Find the entry for the current core by enumerating the vec and popping out the entry that
-    // matches the conditional check on core_id, do this with Vec functions
-    if let Some(index) = pinned_cores
-        .iter()
-        .position(|x| x.core_id.load(SeqCst) == core_id)
+    let target_core_lock = &PINNED_CORES[core_id];
+    let target_core = target_core_lock.lock();
+    if target_core
+        .is_pinned
+        .compare_exchange(true, false, SeqCst, SeqCst)
+        .is_err()
     {
-        // Remove the pinned core entry from the list
-        let pinned_core = pinned_cores.remove(index);
-        unsafe {
-            // Restore previous affinity
-            KeRevertToUserAffinityThreadEx(pinned_core.previous_affinity.load(SeqCst));
-        }
-    } else {
-        // If the core is not pinned, return an error
         return Err(LockError::CoreNotPinned);
     }
-
+    unsafe {
+        KeRevertToUserAffinityThreadEx(previous_affinity);
+    }
     Ok(())
 }

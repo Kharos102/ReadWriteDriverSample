@@ -9,8 +9,9 @@ use core::ffi::c_void;
 use core::panic::Location;
 use core::sync::atomic::Ordering::SeqCst;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-use once_cell::sync::Lazy;
-use wdk_sys::ntddk::{KeRevertToUserAffinityThreadEx, KeSetSystemAffinityThreadEx, __rdtsc};
+use lazy_static::lazy_static;
+use wdk_sys::ntddk::{KeRevertToUserAffinityThreadEx, KeSetSystemAffinityThreadEx};
+use crate::cpu::rdtsc;
 
 /// Flag indicating if the cores should be released
 pub static RELEASE_CORES: AtomicBool = AtomicBool::new(false);
@@ -27,16 +28,17 @@ pub enum LockError {
     CoreNotPinned,
 }
 
-static PINNED_CORES: Lazy<[QueuedLock<PinnedCore>; 64]> = Lazy::new(|| {
-    let pinned_cores = core::array::from_fn(|_| {
-        QueuedLock::new(PinnedCore {
-            core_id: AtomicUsize::new(0),
-            is_pinned: AtomicBool::new(false),
-        })
-    });
-
-    pinned_cores
-});
+lazy_static! {
+    static ref PINNED_CORES: [QueuedLock<PinnedCore>; 64] = {
+        let pinned_cores = core::array::from_fn(|_| {
+            QueuedLock::new(PinnedCore {
+                core_id: AtomicUsize::new(0),
+                is_pinned: AtomicBool::new(false),
+            })});
+    
+        pinned_cores
+    };
+}
 
 struct PinnedCore {
     core_id: AtomicUsize,
@@ -79,9 +81,9 @@ impl<T> QueuedLock<T> {
                 continue;
             } else {
                 if timeout == 0 {
-                    timeout = unsafe { __rdtsc() } + 3_000_000_000 * 5;
+                    timeout = unsafe { rdtsc() } + 3_000_000_000 * 5;
                 } else {
-                    if unsafe { __rdtsc() } > timeout {
+                    if unsafe { rdtsc() } > timeout {
                         panic!("Lock timeout");
                     }
                     let caller_location = self.caller_location.load(SeqCst);

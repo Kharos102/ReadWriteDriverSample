@@ -29,6 +29,7 @@ mod interrupts;
 mod locking;
 mod mdl;
 pub(crate) mod shared;
+mod cpu;
 
 use crate::interrupts::{PageFaultInterruptHandlerManager, PAGE_FAULT_HIT, PROBING_ADDRESS};
 use crate::locking::{CoreLock, CorePin, CORES_CHECKED_IN, CORE_LOCK_HELD, RELEASE_CORES};

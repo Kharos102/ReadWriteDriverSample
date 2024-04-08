@@ -5,7 +5,6 @@
 #[cfg(not(test))]
 extern crate wdk_panic;
 
-use alloc::boxed::Box;
 use alloc::vec;
 use core::{
     arch::asm,
@@ -14,7 +13,6 @@ use core::{
 };
 
 use alloc::vec::Vec;
-use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering::SeqCst;
 #[cfg(not(test))]
 use wdk_alloc::WDKAllocator;
@@ -33,9 +31,8 @@ mod locking;
 mod mdl;
 pub(crate) mod shared;
 
-use crate::device_ctx::{CoreFreezeStatus, Ctx};
 use crate::interrupts::{PageFaultInterruptHandlerManager, PAGE_FAULT_HIT, PROBING_ADDRESS};
-use crate::locking::{CoreLock, CorePin};
+use crate::locking::{CoreLock, CorePin, CORES_CHECKED_IN, CORE_LOCK_HELD, RELEASE_CORES};
 use wdk_sys::{
     ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
     PCUNICODE_STRING,
@@ -44,6 +41,12 @@ use wdk_sys::{
 // Exposed device name used for user<>driver communication
 const NT_DEVICE_NAME_PATH: &str = "\\Device\\ReadWriteDevice";
 const DOS_DEVICE_NAME_PATH: &str = "\\DosDevices\\ReadWriteDevice";
+
+/// Number of logical cores (NUM_LOGICAL_CORES) on the system using OnceLock and KeQueryActiveProcessorCount
+static NUM_LOGICAL_CORES: AtomicUsize = AtomicUsize::new(0);
+
+static mut PAGE_FAULT_MANAGER: Option<Vec<PageFaultInterruptHandlerManager>> = None;
+
 /// Wrapper around the PEPROCESS handle to ensure it is dereferenced when dropped
 struct PeProcessHandle {
     handle: wdk_sys::PEPROCESS,
@@ -162,19 +165,12 @@ pub unsafe extern "system" fn driver_entry(
     let dos_device_name = uni::str_to_unicode(DOS_DEVICE_NAME_PATH);
     // Device object handle to be filled by IoCreateDevice
     let mut device_obj: *mut DEVICE_OBJECT = core::ptr::null_mut();
-    let device_extension_size = {
-        core::cmp::max(
-            core::mem::size_of::<Ctx>(),
-            core::mem::size_of::<core::mem::MaybeUninit<Ctx>>(),
-        )
-    };
+
     let status = {
         let mut nt_device_name_uni = nt_device_name.to_unicode();
         wdk_sys::ntddk::IoCreateDevice(
             driver,
-            device_extension_size
-                .try_into()
-                .expect("Device extension size somehow too large"),
+            0,
             &mut nt_device_name_uni,
             wdk_sys::FILE_DEVICE_UNKNOWN,
             wdk_sys::FILE_DEVICE_SECURE_OPEN,
@@ -186,28 +182,12 @@ pub unsafe extern "system" fn driver_entry(
         // Fail
         return status;
     }
-    // Cast the device extension to a maybeuninit
-    let device_ctx = {
-        let mut boxed_uninit: Box<MaybeUninit<Ctx>> =
-            Box::from_raw((*device_obj).DeviceExtension as *mut _);
-        // Initialize with a default instantiation
-        boxed_uninit.write(Ctx::default());
-
-        let boxed = boxed_uninit.assume_init();
-        // Get a raw non-mut ptr by leaking
-        Box::leak(boxed) as &Ctx
-    };
-
-    // Initialize the number of logical cores
-    let core_count = unsafe { KeQueryActiveProcessorCount(core::ptr::null_mut()) as usize };
-    device_ctx.logical_core_count.store(core_count, SeqCst);
-
     // Set required MajorFunction handlers to permit DeviceIoControl calls from user
     driver.MajorFunction[wdk_sys::IRP_MJ_CREATE as usize] = Some(device_create_close);
     driver.MajorFunction[wdk_sys::IRP_MJ_CLOSE as usize] = Some(device_create_close);
     driver.MajorFunction[wdk_sys::IRP_MJ_DEVICE_CONTROL as usize] = Some(device_ioctl_handler);
     // Support unloading the driver
-    driver.DriverUnload = Some(driver_unload);
+    driver.DriverUnload = Some(device_unload);
 
     // Create symbolic link to device, required for user mode to access the device
     let status = {
@@ -221,13 +201,19 @@ pub unsafe extern "system" fn driver_entry(
         return status;
     }
 
+    // Initialize the number of logical cores
+    {
+        let core_count = unsafe { KeQueryActiveProcessorCount(core::ptr::null_mut()) as usize };
+        NUM_LOGICAL_CORES.store(core_count, SeqCst);
+    }
+
     // At this point we have a device and a symbolic link, return success
     wdk_sys::STATUS_SUCCESS
 }
 
 /// Entry point to handle DeviceIoControl calls from user. Expects a ReadWriteIoctl struct as input.
 pub unsafe extern "C" fn device_ioctl_handler(
-    dev_obj: *mut DEVICE_OBJECT,
+    _dev_obj: *mut DEVICE_OBJECT,
     irp: *mut wdk_sys::IRP,
 ) -> NTSTATUS {
     // Get the control code and input buffer from the IRP
@@ -258,13 +244,8 @@ pub unsafe extern "C" fn device_ioctl_handler(
                 // Input buffer is large enough, handle the request.
                 // First, cast the input buffer to a ReadWriteIoctl struct
                 let ioctl_request = &*(input_buffer as *const shared::ReadWriteIoctl);
-                let ctx = {
-                    assert_ne!((*dev_obj).DeviceExtension, core::ptr::null_mut());
-                    let device_ext = (*dev_obj).DeviceExtension as *mut Ctx;
-                    &*device_ext
-                };
                 // Attempt to handle the request
-                match handle_ioctl_request(ioctl_request, input_buffer_len, ctx) {
+                match handle_ioctl_request(ioctl_request, input_buffer_len) {
                     Ok(_) => {
                         // Handled the request successfully, return success
                         irp.IoStatus.__bindgen_anon_1.Status = wdk_sys::STATUS_SUCCESS;
@@ -448,7 +429,6 @@ struct WriteRequest<'a> {
 fn handle_ioctl_request(
     ioctl_request: &shared::ReadWriteIoctl,
     buffer_len_max: usize,
-    ctx: &Ctx,
 ) -> Result<(), IoctlError> {
     let header = &ioctl_request.header;
     let address = header.address;
@@ -457,7 +437,7 @@ fn handle_ioctl_request(
     // Pin the executing thread to the current core, as we mess with IDTs later
     // we want to ensure we're not task-switched to another core with a separate IDT.
     // This will auto-revert when dropped (end of function)
-    let _core_pin = CorePin::new(ctx);
+    let _core_pin = CorePin::new();
 
     // If we're attempting to write 0 bytes, we can just return success now
     if buffer_len == 0 {
@@ -623,41 +603,25 @@ fn process_from_pid(pid: u32) -> Option<PeProcessHandle> {
 }
 
 /// Unload the driver. This function will delete the symbolic link and the device object if it exists.
-pub unsafe extern "C" fn driver_unload(driver_obj: *mut DRIVER_OBJECT) {
+pub unsafe extern "C" fn device_unload(driver_obj: *mut DRIVER_OBJECT) {
+    // Check if any cores are currently frozen, this should never happen.
+    // If they are frozen, wait a little to see if they unfreeze and if not, panic.
+    if CORES_CHECKED_IN.load(SeqCst) > 0 {
+        for _ in 0..1000 {
+            // Spin
+        }
+        panic!("Cores are still frozen while attempting to unload the driver");
+    }
+
     // Delete symbolic link
     let dos_device_name = uni::str_to_unicode(DOS_DEVICE_NAME_PATH);
     let mut dos_device_name_uni = dos_device_name.to_unicode();
-    assert_eq!(
-        wdk_sys::ntddk::IoDeleteSymbolicLink(&mut dos_device_name_uni),
-        wdk_sys::STATUS_SUCCESS
-    );
+    let _status = wdk_sys::ntddk::IoDeleteSymbolicLink(&mut dos_device_name_uni);
 
-    let device_obj = (*driver_obj).DeviceObject;
-    // Should never be null as we always create it in DriverEntry
-    assert_ne!(device_obj, core::ptr::null_mut());
-    // Get the device extension, this should also never be null
-    let raw_device_ctx = (*device_obj).DeviceExtension as *mut Ctx;
-    {
-        // Create a reference to the ctx
-        let device_ctx = &*raw_device_ctx;
-        // Check if any cores are currently frozen, this should never happen.
-        // If they are frozen, wait a little to see if they unfreeze and if not, panic.
-        let frozen_cores_lock = device_ctx.frozen_cores.status.lock();
-        let mut timeout = 80_000;
-        while *frozen_cores_lock != CoreFreezeStatus::None {
-            timeout -= 1;
-            if timeout == 0 {
-                panic!("Cores are still frozen on driver unload");
-            }
-        }
-        // No cores are frozen at this point.
+    // If we have a device, delete it
+    if !(*driver_obj).DeviceObject.is_null() {
+        wdk_sys::ntddk::IoDeleteDevice((*driver_obj).DeviceObject);
     }
-
-    // Drop the ctx without freeing memory, as that's handled by the kernel
-    core::ptr::drop_in_place(raw_device_ctx);
-
-    // Delete the device
-    wdk_sys::ntddk::IoDeleteDevice(device_obj);
 }
 
 /// Return whether the provided address/usize appears to be on a page boundary

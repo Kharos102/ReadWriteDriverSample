@@ -15,6 +15,8 @@ pub(crate) static PREVIOUS_PAGE_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0)
 
 pub(crate) static PROBING_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) static mut CACHED_IDT: Option<Vec<Arc<SegmentTable>>> = None;
+
 static mut JUNK: u64 = 0;
 
 extern "C" {
@@ -317,6 +319,9 @@ impl PageFaultInterruptHandlerManager {
     }
 
     pub(crate) fn install_interrupt_handler(&mut self) {
+        unsafe {
+            asm!("int3");
+        }
         let handler =
             InterruptHandler::PageFaultHandler(page_fault_handler, PageFaultVector::new());
         // Only replace the handler if it's different from the current handler

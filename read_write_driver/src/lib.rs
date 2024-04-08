@@ -25,6 +25,7 @@ extern crate alloc;
 
 pub(crate) mod uni;
 
+mod device_ctx;
 mod interrupts;
 mod locking;
 mod mdl;

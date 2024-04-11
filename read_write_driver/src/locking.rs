@@ -3,6 +3,7 @@
 // goes out of scope. Uses Atomics and a ticket approach to obtain the lock
 // and ensure callers are provided access in the order they requested it.
 
+use crate::cpu::rdtsc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -11,7 +12,6 @@ use core::sync::atomic::Ordering::SeqCst;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use lazy_static::lazy_static;
 use wdk_sys::ntddk::{KeRevertToUserAffinityThreadEx, KeSetSystemAffinityThreadEx};
-use crate::cpu::rdtsc;
 
 /// Flag indicating if the cores should be released
 pub static RELEASE_CORES: AtomicBool = AtomicBool::new(false);
@@ -34,8 +34,9 @@ lazy_static! {
             QueuedLock::new(PinnedCore {
                 core_id: AtomicUsize::new(0),
                 is_pinned: AtomicBool::new(false),
-            })});
-    
+            })
+        });
+
         pinned_cores
     };
 }

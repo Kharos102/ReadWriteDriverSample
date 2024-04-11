@@ -2,41 +2,38 @@
 #![feature(negative_impls)]
 #![no_std]
 
+extern crate alloc;
 #[cfg(not(test))]
 extern crate wdk_panic;
 
 use alloc::vec;
-use core::{
-    arch::asm,
-    ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicUsize},
-};
-
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering::SeqCst;
+use core::{arch::asm, ffi::c_void, sync::atomic::AtomicUsize};
+
 #[cfg(not(test))]
 use wdk_alloc::WDKAllocator;
+use wdk_sys::{
+    ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
+    PCUNICODE_STRING,
+};
+
+use crate::interrupts::{PageFaultInterruptHandlerManager, PAGE_FAULT_HIT, PROBING_ADDRESS};
+use crate::locking::{
+    CoreLock, CorePin, QueuedLock, CORES_CHECKED_IN, CORE_LOCK_HELD, RELEASE_CORES,
+};
 
 #[cfg(not(test))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: WDKAllocator = WDKAllocator;
 
-extern crate alloc;
-
 pub(crate) mod uni;
 
+mod cpu;
 mod interrupts;
 mod locking;
 mod mdl;
 pub(crate) mod shared;
-mod cpu;
-
-use crate::interrupts::{PageFaultInterruptHandlerManager, PAGE_FAULT_HIT, PROBING_ADDRESS};
-use crate::locking::{CoreLock, CorePin, CORES_CHECKED_IN, CORE_LOCK_HELD, RELEASE_CORES};
-use wdk_sys::{
-    ntddk::KeQueryActiveProcessorCount, DEVICE_OBJECT, DRIVER_OBJECT, NTSTATUS, NT_SUCCESS,
-    PCUNICODE_STRING,
-};
 
 // Exposed device name used for user<>driver communication
 const NT_DEVICE_NAME_PATH: &str = "\\Device\\ReadWriteDevice";
@@ -45,7 +42,8 @@ const DOS_DEVICE_NAME_PATH: &str = "\\DosDevices\\ReadWriteDevice";
 /// Number of logical cores (NUM_LOGICAL_CORES) on the system using OnceLock and KeQueryActiveProcessorCount
 static NUM_LOGICAL_CORES: AtomicUsize = AtomicUsize::new(0);
 
-static mut PAGE_FAULT_MANAGER: Option<Vec<PageFaultInterruptHandlerManager>> = None;
+static PAGE_FAULT_MANAGER: QueuedLock<Vec<PageFaultInterruptHandlerManager>> =
+    QueuedLock::new(vec![]);
 
 /// Wrapper around the PEPROCESS handle to ensure it is dereferenced when dropped
 struct PeProcessHandle {
@@ -289,43 +287,36 @@ fn check_and_write(
 }
 
 fn check_and_write_page_fault(write_request: WriteRequest) -> Result<(), IoctlError> {
+    let mut global_manager_lock = PAGE_FAULT_MANAGER.lock();
     // Install our custom page fault handler
     let handler_manager = {
         // Temporarily lower IRQL to support page faults
         let _irql_guard = lower_irql_to_passive(IrqlMethod::LowerIrqlDirect);
-        let current_core =
-            unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) };
+
         let mut handler_manager = None;
         // Check if we have one already, if so return a mutable reference
-        if let Some(manager) = unsafe { &mut PAGE_FAULT_MANAGER } {
-            // Attempt to find a manager with the same core_id as us
-            let current_core =
-                unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) };
-            for manager in manager.iter_mut() {
-                if manager.core_id == current_core as u64 {
-                    // Ensure things are still paged in
-                    manager.page_in_idt();
-                    handler_manager = Some(manager);
-                    break;
-                }
+        // Attempt to find a manager with the same core_id as us
+        let current_core =
+            unsafe { wdk_sys::ntddk::KeGetCurrentProcessorNumberEx(core::ptr::null_mut()) };
+
+        for manager in global_manager_lock.iter_mut() {
+            if manager.core_id == current_core as u64 {
+                // Ensure things are still paged in
+                manager.page_in_idt();
+                handler_manager = Some(manager);
+                break;
             }
         }
+
         if handler_manager.is_none() {
             // Pagein IDT
             let mdl = interrupts::pagein_unprotect_idt();
             // If we don't have one, create a new one and store it
             let manager = PageFaultInterruptHandlerManager::new(mdl, current_core as u64);
             // Add the manager to the global vector
-            unsafe {
-                if let Some(manager_vec) = &mut PAGE_FAULT_MANAGER {
-                    manager_vec.push(manager);
-                } else {
-                    PAGE_FAULT_MANAGER = Some(vec![manager]);
-                }
-            }
+            global_manager_lock.push(manager);
             // Set handler_manager to the newly created manager
-            handler_manager =
-                Some(unsafe { PAGE_FAULT_MANAGER.as_mut().unwrap().last_mut().unwrap() });
+            handler_manager = Some(global_manager_lock.last_mut().unwrap());
         }
 
         handler_manager.unwrap()
@@ -388,7 +379,7 @@ fn check_and_write_windows(write_request: WriteRequest) -> Result<(), IoctlError
 
 fn switch_cr3(new_cr3: usize) -> Cr3SwitchGuard {
     let previous_cr3 = unsafe {
-        let mut previous_cr3: usize = 0;
+        let previous_cr3: usize;
         asm!(
             "mov {}, cr3",
             out(reg) previous_cr3,

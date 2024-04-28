@@ -437,7 +437,11 @@ fn handle_ioctl_request(
         return Ok(());
     }
     // Validate that the entire ReadWriteIoctl request (incl. dynamic buffer) is within the input buffer max bounds
-    if core::mem::size_of::<shared::ReadWriteIoctl>() + buffer_len > buffer_len_max {
+    if core::mem::size_of::<shared::ReadWriteIoctl>()
+        .checked_add(buffer_len)
+        .ok_or(IoctlError::InvalidBufferSize)?
+        > buffer_len_max
+    {
         // The size of the provided ioctl_request (including the dynamic buffer portion) exceeds the bounds of the provided input buffer,
         // if we continued to parse the request we'd be reading out of bounds. Return an error.
         return Err(IoctlError::InvalidBufferSize);

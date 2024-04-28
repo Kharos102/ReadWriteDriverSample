@@ -7,7 +7,7 @@ use crate::shared::IoctlSymbolOffsets;
 use anyhow::Error;
 use clap::Parser;
 use clap_num::maybe_hex;
-use pdb::{FallibleIterator, RawString};
+use pdb::{FallibleIterator, RawString, TypeFinder};
 use pdblister::symsrv::SymFileInfo;
 use pdblister::{connect_servers, get_pdb, ManifestEntry};
 use windows::Win32::System::IO::DeviceIoControl;
@@ -29,12 +29,12 @@ struct Args {
     #[arg(short, long)]
     pid: u32,
 
-    // Address to write into, may be in decimal or hex (when prefixed with 0x)
+    /// Address to write into, may be in decimal or hex (when prefixed with 0x)
     #[arg(short, long, value_parser=maybe_hex::<usize>)]
     address: usize,
 
-    // Determines if we download and parse NT symbols to resolve offsets for the driver
-    #[arg(short, long)]
+    /// Determines if we download and parse NT symbols to resolve offsets for the driver
+    #[arg(short, long, action)]
     use_symbols: bool,
 }
 
@@ -52,10 +52,16 @@ async fn main() {
 
 async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
     let filepath = "C:\\Windows\\System32\\ntoskrnl.exe";
+    // get user temp path
+    let temp_path = std::env::temp_dir();
     // Get env var NT_SYMBOL_PATH if it exists, otherwise hardcode https://msdl.microsoft.com/download/symbols
     let sym_path = match std::env::var("_NT_SYMBOL_PATH") {
         Ok(val) => val,
-        Err(_) => "SRV*https://msdl.microsoft.com/download/symbols".to_string(),
+        Err(_) => format!(
+            "srv*{}*https://msdl.microsoft.com/download/symbols",
+            temp_path.display()
+        )
+        .to_string(),
     };
     let result: Result<(&'static str, PathBuf), anyhow::Error> = async {
         let servers = connect_servers(&sym_path)?;
@@ -91,7 +97,9 @@ async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
     match result {
         Ok((_message, path)) => {
             let mut va_space_deleted = None;
+            let mut va_space_idx = None;
             let mut directory_table_base = None;
+            let mut bit_pos = None;
             let file = std::fs::File::open(path)?;
             let mut pdb = pdb::PDB::open(file)?;
 
@@ -115,31 +123,35 @@ async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
                         // To find information about the fields, find and parse that Type
                         match type_finder.find(fields)?.parse()? {
                             pdb::TypeData::FieldList(list) => {
-                                // `fields` is a Vec<TypeData>
-                                for field in list.fields {
-                                    if let pdb::TypeData::Member(member) = field {
-                                        if member.name == RawString::from("DirectoryTableBase") {
-                                            directory_table_base = Some(member.offset);
-                                            if va_space_deleted.is_some() {
-                                                break 'loop1;
-                                            }
-                                        } else if member.name == RawString::from("VaSpaceDeleted") {
-                                            va_space_deleted = Some(member.offset);
-                                            if directory_table_base.is_some() {
-                                                break 'loop1;
-                                            }
-                                        }
-                                    } else {
-                                        // handle member functions, nested types, etc.
-                                    }
-                                }
-
-                                if let Some(_more_fields) = list.continuation {
-                                    // A FieldList can be split across multiple records
-                                    // TODO: follow `more_fields` and handle the next FieldList
+                                find_from_fieldlist(
+                                    &mut type_finder,
+                                    &list,
+                                    &mut va_space_deleted,
+                                    &mut va_space_idx,
+                                    &mut directory_table_base,
+                                    &mut bit_pos,
+                                );
+                                if va_space_deleted.is_some()
+                                    && directory_table_base.is_some()
+                                    && bit_pos.is_some()
+                                {
+                                    break 'loop1;
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    Ok(pdb::TypeData::Bitfield(bitfield)) => {
+                        let underlying_type = bitfield.underlying_type;
+                        if underlying_type.0 == 0x1334 {
+                            println!("bitfield: {:#x?}", bitfield);
+                        }
+                    }
+                    Ok(pdb::TypeData::Union(uniont)) => {
+                        if uniont.fields.0 == 0x1334
+                            || uniont.name == RawString::from("ProcessFlags")
+                        {
+                            println!("union: {:#x?}", uniont);
                         }
                     }
                     Ok(_) => {
@@ -156,11 +168,15 @@ async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
                 }
             }
 
-            if let (Some(va_space_deleted), Some(directory_table_base)) =
-                (va_space_deleted, directory_table_base)
+            if let (Some(va_space_deleted), Some(directory_table_base), Some(bit_pos)) =
+                (va_space_deleted, directory_table_base, bit_pos)
             {
+                let va_space_deleted = shared::VaSpaceDeleted {
+                    offset: va_space_deleted as usize,
+                    bit_pos: bit_pos as usize,
+                };
                 return Ok(shared::IoctlSymbolOffsets {
-                    va_space_deleted: Some(va_space_deleted as usize),
+                    va_space_deleted: Some(va_space_deleted),
                     directory_table_base: Some(directory_table_base as usize),
                 });
             } else {
@@ -169,6 +185,60 @@ async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
         }
         Err(e) => {
             return Err(e);
+        }
+    }
+}
+
+fn find_from_fieldlist(
+    type_finder: &mut TypeFinder,
+    list: &pdb::FieldList,
+    va_space_deleted: &mut Option<usize>,
+    va_space_idx: &mut Option<usize>,
+    directory_table_base: &mut Option<usize>,
+    bit_pos: &mut Option<usize>,
+) {
+    for field in &list.fields {
+        if let pdb::TypeData::Member(member) = field {
+            if member.name == RawString::from("DirectoryTableBase") {
+                *directory_table_base = Some(member.offset as usize);
+                if va_space_deleted.is_some() && bit_pos.is_some() {
+                    break;
+                }
+            } else if member.name == RawString::from("VaSpaceDeleted") {
+                *va_space_deleted = Some(member.offset as usize);
+                println!("va_space_index:{:#x}", member.field_type.0);
+                *va_space_idx = Some(member.field_type.0 as usize);
+
+                let newt = type_finder
+                    .find(member.field_type)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if let pdb::TypeData::Bitfield(bitfield) = newt {
+                    *bit_pos = Some(bitfield.position as usize);
+                }
+
+                if directory_table_base.is_some() && bit_pos.is_some() {
+                    break;
+                }
+            }
+        }
+
+        if let Some(more_fields) = list.continuation {
+            let new_list = type_finder.find(more_fields).unwrap().parse().unwrap();
+            if let pdb::TypeData::FieldList(nlist) = new_list {
+                // A FieldList can be split across multiple records
+                find_from_fieldlist(
+                    type_finder,
+                    &nlist,
+                    va_space_deleted,
+                    va_space_idx,
+                    directory_table_base,
+                    bit_pos,
+                );
+            } else {
+                panic!("Expected FieldList");
+            }
         }
     }
 }

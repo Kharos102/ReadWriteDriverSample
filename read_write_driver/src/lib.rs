@@ -473,11 +473,14 @@ fn handle_ioctl_request(
             let _irql_guard = raise_irql_to_dispatch(IrqlMethod::RaiseIrqlDirect);
             // Only proceed if the VA space isn't deleted. This check is only performed if we have
             // the symbol offset.
-            if let Some(va_space_deleted_offset) = header.symbols.va_space_deleted {
+            if let Some(va_space_deleted_s) = &header.symbols.va_space_deleted {
                 let va_space_deleted = unsafe {
                     let va_space_deleted_ptr =
-                        (process.handle as *const u8).add(va_space_deleted_offset) as *const u8;
-                    *va_space_deleted_ptr
+                        (process.handle as *const u8).add(va_space_deleted_s.offset) as *const u8;
+                    let va_space_deleted = ((*(va_space_deleted_ptr as *const u32))
+                        >> va_space_deleted_s.bit_pos)
+                        & 0b1;
+                    va_space_deleted as usize
                 };
                 if va_space_deleted != 0 {
                     // Return out if the VA space is deleted

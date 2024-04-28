@@ -23,5 +23,12 @@ pub(crate) struct ReadWriteIoctlHeader {
 #[derive(Debug)]
 pub(crate) struct IoctlSymbolOffsets {
     pub(crate) directory_table_base: Option<usize>,
-    pub(crate) va_space_deleted: Option<usize>,
+    pub(crate) va_space_deleted: Option<VaSpaceDeleted>,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct VaSpaceDeleted {
+    pub(crate) offset: usize,
+    pub(crate) bit_pos: usize,
 }

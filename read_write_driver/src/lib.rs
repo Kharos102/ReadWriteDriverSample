@@ -97,6 +97,7 @@ enum IoctlError {
     InvalidBufferSize,
     InvalidPid,
     InvalidCr3,
+    VaSpaceDeleted,
     InvalidAddress,
 }
 
@@ -106,6 +107,7 @@ impl IoctlError {
             IoctlError::InvalidBufferSize => wdk_sys::STATUS_INVALID_BUFFER_SIZE,
             IoctlError::InvalidPid => wdk_sys::STATUS_INVALID_PARAMETER,
             IoctlError::InvalidCr3 => wdk_sys::STATUS_INVALID_PARAMETER,
+            IoctlError::VaSpaceDeleted => wdk_sys::STATUS_INVALID_PARAMETER,
             IoctlError::InvalidAddress => wdk_sys::STATUS_ACCESS_VIOLATION,
         }
     }
@@ -451,8 +453,9 @@ fn handle_ioctl_request(
     };
 
     // Get offset 0x28 from the KPROCESS which is the DirectoryTableBase / cr3
+    // Attempt to get it from the provided symbols first, if not use the default offset
     let cr3 = unsafe {
-        let cr3_offset = 0x28;
+        let cr3_offset = header.symbols.directory_table_base.unwrap_or_else(|| 0x28);
         let cr3_ptr = (process.handle as *const u8).add(cr3_offset) as *const usize;
         *cr3_ptr
     };
@@ -468,6 +471,19 @@ fn handle_ioctl_request(
         {
             // Raise our IRQL to prevent task-switching
             let _irql_guard = raise_irql_to_dispatch(IrqlMethod::RaiseIrqlDirect);
+            // Only proceed if the VA space isn't deleted. This check is only performed if we have
+            // the symbol offset.
+            if let Some(va_space_deleted_offset) = header.symbols.va_space_deleted {
+                let va_space_deleted = unsafe {
+                    let va_space_deleted_ptr =
+                        (process.handle as *const u8).add(va_space_deleted_offset) as *const u8;
+                    *va_space_deleted_ptr
+                };
+                if va_space_deleted != 0 {
+                    // Return out if the VA space is deleted
+                    return Err(IoctlError::VaSpaceDeleted);
+                }
+            }
             // Modify our CR3 to the targets, backing up our original cr3
             // and auto-restoring on drop
             let _cr3_guard = switch_cr3(cr3);

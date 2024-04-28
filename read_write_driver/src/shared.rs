@@ -15,5 +15,13 @@ pub(crate) struct ReadWriteIoctl {
 pub(crate) struct ReadWriteIoctlHeader {
     pub(crate) target_pid: u32,
     pub(crate) address: usize,
+    pub(crate) symbols: IoctlSymbolOffsets,
     pub(crate) buffer_len: usize,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct IoctlSymbolOffsets {
+    pub(crate) directory_table_base: Option<usize>,
+    pub(crate) va_space_deleted: Option<usize>,
 }

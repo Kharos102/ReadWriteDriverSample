@@ -8,6 +8,10 @@ authors = ["Christopher Vella <cvella@signal-labs.com>"]
 [dependencies]
 clap = { version = "4.5.1", features=["derive"] }
 clap-num = "1.1.1"
+pdblister = {path = "../pdblister"}
+anyhow = "1.0.82"
+pdb = "0.8.0"
+tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros"] }
 
 [dependencies.windows]
 version = "0.52"

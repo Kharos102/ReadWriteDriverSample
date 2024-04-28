@@ -9,7 +9,7 @@ use clap::Parser;
 use clap_num::maybe_hex;
 use pdb::{FallibleIterator, RawString};
 use pdblister::symsrv::SymFileInfo;
-use pdblister::{connect_servers, get_pdb, ManifestEntry, MessageFormat};
+use pdblister::{connect_servers, get_pdb, ManifestEntry};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE},
@@ -89,7 +89,7 @@ async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
     .await;
 
     match result {
-        Ok((message, path)) => {
+        Ok((_message, path)) => {
             let mut va_space_deleted = None;
             let mut directory_table_base = None;
             let file = std::fs::File::open(path)?;
@@ -105,8 +105,8 @@ async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
                 // parse the type record
                 match typ.parse() {
                     Ok(pdb::TypeData::Class(pdb::ClassType {
-                        name,
-                        properties,
+                        name: _,
+                        properties: _,
                         fields: Some(fields),
                         ..
                     })) => {
@@ -134,7 +134,7 @@ async fn get_nt_symbols() -> Result<shared::IoctlSymbolOffsets, anyhow::Error> {
                                     }
                                 }
 
-                                if let Some(more_fields) = list.continuation {
+                                if let Some(_more_fields) = list.continuation {
                                     // A FieldList can be split across multiple records
                                     // TODO: follow `more_fields` and handle the next FieldList
                                 }

@@ -15,6 +15,8 @@ There's a few fun techniques in this that have been individually useful outside 
 
 This thing is also written in Rust.
 
+For PDB parsing, I pulled in and modified pdblister https://github.com/microsoft/pdblister to support building as a lib.
+
 # How to Use
 
 - Navigate to read_write_driver

@@ -1,0 +1,6 @@
+/target/
+.vscode/
+**/*.rs.bk
+manifest
+symbols
+
